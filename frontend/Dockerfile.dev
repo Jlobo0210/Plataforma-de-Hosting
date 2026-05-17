@@ -1,0 +1,20 @@
+# ── Imagen base ───────────────────────────────────────────────────────────────
+FROM node:18-slim
+
+# ── Directorio de trabajo ─────────────────────────────────────────────────────
+WORKDIR /app
+
+# ── Dependencias ──────────────────────────────────────────────────────────────
+# Copiamos solo package.json primero para aprovechar caché de Docker
+COPY package*.json .
+
+RUN npm install
+
+# ── Código fuente ─────────────────────────────────────────────────────────────
+COPY . .
+
+# ── Puerto expuesto ───────────────────────────────────────────────────────────
+EXPOSE 3000
+
+# ── Arranque (modo desarrollo con hot-reload) ─────────────────────────────────
+CMD ["npm", "start"]

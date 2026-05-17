@@ -1,0 +1,44 @@
+# ── Imagen base ──────────────────────────────────────────────────────────────
+FROM python:3.12-slim
+
+
+# ── Dependencias del sistema ──────────────────────────────────────────────────
+RUN apt-get update && apt-get install -y \
+    # Para instalar docker CLI
+    curl \
+    gnupg \
+    ca-certificates \
+    lsb-release \
+    # Para inotify (ver cambios en archivos, opcional)
+    inotify-tools \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── Instalar Docker CLI (no el daemon, solo el cliente) ───────────────────────
+RUN curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] \
+    https://download.docker.com/linux/debian $(lsb_release -cs) stable" \
+    | tee /etc/apt/sources.list.d/docker.list > /dev/null \
+    && apt-get update \
+    && apt-get install -y docker-ce-cli \
+    && rm -rf /var/lib/apt/lists/*
+
+
+
+# Evita archivos .pyc y activa logs sin buffer
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+# ── Dependencias ──────────────────────────────────────────────────────────────
+COPY requirements.docker.txt .
+RUN pip install --no-cache-dir -r requirements.docker.txt
+
+# ── Código fuente ─────────────────────────────────────────────────────────────
+COPY . .
+
+# ── Puerto expuesto ───────────────────────────────────────────────────────────
+EXPOSE 8000
+
+# ── Arranque (modo desarrollo con hot-reload) ─────────────────────────────────
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]

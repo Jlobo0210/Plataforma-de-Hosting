@@ -1,0 +1,48 @@
+version: '3.8'
+
+services:
+  nginx:
+    build: ./nginx
+    ports:
+      - "80:80"
+    volumes:
+      - nginx_locations:/etc/nginx/locations
+    networks:
+      - platform_network
+    depends_on:
+      - backend
+      - frontend
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    environment:
+      - DOCKER_NETWORK=platform_network
+      - NGINX_CONFIG_PATH=/nginx_locations
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock 
+      - nginx_locations:/nginx_locations  
+    ports:
+      - "8000:8000"
+    networks:
+      - platform_network
+    restart: unless-stopped      
+    stop_grace_period: 20s      
+
+
+  frontend:
+    build: 
+      context: ./frontend
+      dockerfile: Dockerfile
+    networks:
+      - platform_network
+    restart: unless-stopped 
+
+volumes:
+  nginx_locations:
+
+networks:
+  platform_network:
+    name: platform_network   
