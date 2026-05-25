@@ -39,34 +39,45 @@ app.add_middleware(
 
 class CreateServiceRequest(BaseModel):
     name: str
+    username: str
     code: str
     language: str  # "python" | "javascript"
-    description: str = ""  
+    port: int = 8080
+    description: str = ""
 
 @app.post("/api/services")
 async def create_service(request: CreateServiceRequest):
-    """Crea un nuevo microservicio."""
+    """Crea un nuevo proyecto y lo publica en {name}.{username}.localhost."""
     try:
-        # 1. Crear el contenedor
         service_info = docker_mgr.create_microservice(
             name=request.name,
             code=request.code,
             language=request.language,
             description=request.description
         )
-        
-        # 2. Agregar ruta en NGINX
-        nginx_mgr.add_route(
-            service_id=service_info["service_id"],
+
+        hostname = nginx_mgr.add_project_route(
+            project_id=service_info["service_id"],
+            project_name=request.name,
+            username=request.username,
             container_name=service_info["container_name"],
-            endpoint=f"{request.name}-{service_info['service_id']}"
+            port=request.port,
         )
-        
+
+        url = f"http://{hostname}"
+        service_id = service_info["service_id"]
+        if service_id in docker_mgr.active_services:
+            docker_mgr.active_services[service_id]["hostname"] = hostname
+            docker_mgr.active_services[service_id]["url"] = url
+            docker_mgr.active_services[service_id]["username"] = request.username
+            docker_mgr.active_services[service_id]["port"] = request.port
+
         return {
             "success": True,
             "service_id": service_info["service_id"],
-            "endpoint": service_info["endpoint"],
-            "message": f"Microservicio disponible en {service_info['endpoint']}"
+            "hostname": hostname,
+            "url": url,
+            "message": f"Proyecto disponible en {url}"
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

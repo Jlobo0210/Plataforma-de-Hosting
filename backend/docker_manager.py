@@ -283,7 +283,8 @@ try {
                 "code": code,
                 "description": description,
                 "status": "active",
-                "endpoint": f"/api/services/{name}-{service_id}",
+                "hostname": None,
+                "url": None,
                 "function": None,
                 "params": []
             }
@@ -300,7 +301,6 @@ try {
             return {
                 "service_id": service_id,
                 "container_name": container_name,
-                "endpoint": f"/api/services/{name}-{service_id}",
                 "function": params_info.get("function"),
                 "params": params_info.get("params", [])
             }
