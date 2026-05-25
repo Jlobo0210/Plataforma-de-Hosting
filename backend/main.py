@@ -61,7 +61,15 @@ async def create_service(request: CreateServiceRequest):
             container_name=service_info["container_name"],
             endpoint=f"{request.name}-{service_info['service_id']}"
         )
-        
+
+        url = f"http://{hostname}"
+        service_id = service_info["service_id"]
+        if service_id in docker_mgr.active_services:
+            docker_mgr.active_services[service_id]["hostname"] = hostname
+            docker_mgr.active_services[service_id]["url"] = url
+            docker_mgr.active_services[service_id]["username"] = request.username
+            docker_mgr.active_services[service_id]["port"] = request.port
+
         return {
             "success": True,
             "service_id": service_info["service_id"],

@@ -2,7 +2,10 @@ FROM nginx:alpine
 
 RUN apk add --no-cache inotify-tools
 
-# Crear carpeta para locations dinámicas
+# Carpeta para configuraciones dinámicas de proyectos.
+# El backend escribe aquí archivos project_*.conf (server blocks completos
+# para subdominios proyecto.usuario.localhost). reload_watch.sh detecta
+# cambios y recarga NGINX sin reinicio.
 RUN mkdir -p /etc/nginx/locations
 
 COPY nginx.conf /etc/nginx/nginx.conf
