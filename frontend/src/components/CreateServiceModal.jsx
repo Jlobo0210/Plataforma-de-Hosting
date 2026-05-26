@@ -17,7 +17,11 @@ const EMPTY = {
   port: "",
 };
 
-const RESERVED_PORTS = [80, 443, 22, 3000, 8080];
+// Puerto TCP del contenedor: cualquier valor 1-65535 vale.
+// Es interno al network de Docker, no al host, asi que no hay conflicto
+// con puertos "privilegiados" del sistema host.
+const MIN_PORT = 1;
+const MAX_PORT = 65535;
 
 export default function CreateServiceModal({ isOpen, user, onClose, onSubmit }) {
   const [form, setForm]     = useState(EMPTY);
@@ -56,10 +60,8 @@ export default function CreateServiceModal({ isOpen, user, onClose, onSubmit }) 
     const portNum = Number(form.port);
     if (!form.port) {
       e.port = "El puerto es requerido";
-    } else if (!Number.isInteger(portNum) || portNum < 1024 || portNum > 65535) {
-      e.port = "Puerto entre 1024 y 65535";
-    } else if (RESERVED_PORTS.includes(portNum)) {
-      e.port = `El puerto ${portNum} está reservado`;
+    } else if (!Number.isInteger(portNum) || portNum < MIN_PORT || portNum > MAX_PORT) {
+      e.port = `Puerto entre ${MIN_PORT} y ${MAX_PORT}`;
     }
 
     return e;
@@ -214,15 +216,15 @@ export default function CreateServiceModal({ isOpen, user, onClose, onSubmit }) 
                 type="number"
                 value={form.port}
                 onChange={(e) => set("port", e.target.value)}
-                placeholder="ej: 3000"
-                min={1024}
-                max={65535}
+                placeholder="ej: 80"
+                min={MIN_PORT}
+                max={MAX_PORT}
                 className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2.5 text-sm font-mono text-slate-200 focus:outline-none focus:border-cyan-600 placeholder:text-slate-600 transition-colors"
               />
             </div>
             {errors.port
               ? <p className="text-xs text-red-400 mt-1">{errors.port}</p>
-              : <p className="text-xs text-slate-600 mt-1">Puertos válidos: 1024 – 65535</p>
+              : <p className="text-xs text-slate-600 mt-1">Debe coincidir con el puerto que tu Dockerfile expone (EXPOSE).</p>
             }
           </div>
 

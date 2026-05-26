@@ -1,233 +1,122 @@
 import docker
 import uuid
 import os
-import ast
-import json
 import time
 import threading
+import git
+import tempfile
+import shutil
+
+
+IDLE_TIMEOUT_SECONDS = 30 * 60  # PDF: apagar contenedores tras 30 min sin tráfico
+MONITOR_INTERVAL_SECONDS = 5
+IDLE_WATCHER_INTERVAL_SECONDS = 60
+
 
 class DockerManager:
     def __init__(self):
         self.client = docker.from_env()
         self.network_name = os.getenv("DOCKER_NETWORK", "platform_network")
         self.active_services = {}
-        self.templates_dir = os.path.join(os.path.dirname(__file__), "templates")
-        self._monitor_running = False  
+        self._threads_started = False
 
-        print("Construyendo imágenes base...")
-        self._build_base_images()
-        print("Imágenes base listas.")
-
-        # Iniciar el monitor en segundo plano
-        self._start_monitor()
-
-    # ─────────────────────────────────────────────────────
-    # Monitor de contenedores
-    # ─────────────────────────────────────────────────────
-
-    def _start_monitor(self):
-        """Inicia el hilo monitor en segundo plano."""
-        self._monitor_running = True
-        self._monitor_thread = threading.Thread(
-            target=self._monitor_loop,
-            daemon=True  
-        )
-        self._monitor_thread.start()
-        print("👀 Monitor de contenedores iniciado")
-
-    def _stop_monitor(self):
-        """Detiene el hilo monitor."""
-        self._monitor_running = False
+    def start_background_threads(self) -> None:
+        """
+        Arranca los hilos de monitoreo. Se invoca desde el lifespan de la
+        app, no desde __init__, para evitar que corran durante imports en
+        tests o durante el cleanup_all inicial.
+        """
+        if self._threads_started:
+            return
+        self._threads_started = True
+        threading.Thread(target=self._monitor_loop, daemon=True).start()
+        threading.Thread(target=self._idle_watcher, daemon=True).start()
+        print("👀 Hilos de monitoreo arrancados (status sync + idle watcher)")
 
     def _monitor_loop(self):
         """
-        Revisa el estado real de los contenedores cada 10s
-        y actualiza active_services si hay cambios.
+        Sincroniza periódicamente el campo `status` con el estado real
+        del contenedor en Docker. No sobreescribe `idle` ni `inactive`,
+        que son estados lógicos manejados por el watcher / el usuario.
         """
-        while self._monitor_running:
-            try:
-                self._sync_container_statuses()
-            except Exception as e:
-                print(f"⚠️  [Monitor] Error: {e}")
-            time.sleep(5)  
+        while True:
+            for pid, info in list(self.active_services.items()):
+                try:
+                    container = self.client.containers.get(info["container_id"])
+                    container.reload()
+                    if info.get("status") in ("idle", "inactive"):
+                        continue
+                    info["status"] = "active" if container.status == "running" else "inactive"
+                except docker.errors.NotFound:
+                    info["status"] = "inactive"
+                except Exception as e:
+                    print(f"⚠️  [Monitor] Error revisando {info.get('container_name')}: {e}")
+            time.sleep(MONITOR_INTERVAL_SECONDS)
 
-    def _sync_container_statuses(self):
-        """Sincroniza el estado de active_services con Docker."""
-        if not self.active_services:
+    def _idle_watcher(self):
+        """Apaga contenedores con más de IDLE_TIMEOUT_SECONDS sin tráfico."""
+        while True:
+            now = time.time()
+            for pid, info in list(self.active_services.items()):
+                if info.get("status") != "active":
+                    continue
+                last = info.get("last_active", now)
+                if now - last > IDLE_TIMEOUT_SECONDS:
+                    self._idle_stop(pid)
+            time.sleep(IDLE_WATCHER_INTERVAL_SECONDS)
+
+    def _idle_stop(self, project_id: str):
+        info = self.active_services.get(project_id)
+        if not info:
+            return
+        try:
+            container = self.client.containers.get(info["container_id"])
+            container.stop(timeout=5)
+            info["status"] = "idle"
+            print(f"💤 Apagado por inactividad: {info['container_name']}")
+        except Exception as e:
+            print(f"⚠️  Error apagando por idle {info.get('container_name')}: {e}")
+
+    def _record_activity(self, project_id: str):
+        info = self.active_services.get(project_id)
+        if info is not None:
+            info["last_active"] = time.time()
+
+    def wake_project(self, project_id: str):
+        """
+        Garantiza que el contenedor del proyecto esté corriendo y refresca
+        `last_active`. Llamado por el endpoint `/_wake` desde NGINX en
+        cada request del usuario.
+
+        Excepciones:
+        - KeyError: el proyecto no existe (NGINX devolverá 500 al cliente).
+        - PermissionError: el dueño lo deshabilitó manualmente; no se
+          revive (NGINX devolverá 500; el dueño debe hacer PATCH /enable).
+        - RuntimeError: cold start falló (timeout, etc.).
+        """
+        if project_id not in self.active_services:
+            raise KeyError(project_id)
+
+        info = self.active_services[project_id]
+
+        if info.get("status") == "inactive":
+            raise PermissionError("Proyecto deshabilitado por el usuario")
+
+        self._record_activity(project_id)
+
+        if info.get("status") == "active":
             return
 
-        for service_id, service in list(self.active_services.items()):
-            try:
-                container = self.client.containers.get(service["container_id"])
-                container.reload()
-
-                # Mapear estado de Docker a estado de la plataforma
-                status_map = {
-                    "running":    "active",
-                    "exited":     "inactive",
-                    "paused":     "inactive",
-                    "restarting": "inactive",
-                    "dead":       "inactive",
-                    "created":    "inactive",
-                }
-                new_status = status_map.get(container.status, "inactive")
-                old_status = service.get("status")
-
-                # Solo actualizar si cambió el estado
-                if new_status != old_status:
-                    print(f"🔄 [Monitor] {service['container_name']}: {old_status} → {new_status}")
-                    self.active_services[service_id]["status"] = new_status
-
-            except docker.errors.NotFound:
-                # El contenedor fue eliminado externamente
-                print(f"⚠️  [Monitor] Contenedor no encontrado, marcando como inactive: {service['container_name']}")
-                self.active_services[service_id]["status"] = "inactive"
-
-            except Exception as e:
-                print(f"⚠️  [Monitor] Error revisando {service.get('container_name')}: {e}")
-
-    # ─────────────────────────────────────────────────────
-    # Build de imágenes base
-    # ─────────────────────────────────────────────────────
-
-    def _build_base_images(self):
-        base_images = {
-            "python": {
-                "tag": "ms-platform-python:latest",
-                "path": os.path.join(self.templates_dir, "python")
-            },
-            "javascript": {
-                "tag": "ms-platform-javascript:latest",
-                "path": os.path.join(self.templates_dir, "javascript")
-            }
-        }
-        
-        for lang, config in base_images.items():
-            try:
-                self.client.images.get(config["tag"])
-                print(f"  [{lang}] Imagen ya existe, saltando build.")
-            except docker.errors.ImageNotFound:
-                print(f"  [{lang}] Construyendo imagen base...")
-                self.client.images.build(
-                    path=config["path"],
-                    tag=config["tag"],
-                    rm=True
-                )
-                print(f"  [{lang}] Imagen lista.")
-
-    # ─────────────────────────────────────────────────────
-    # Parsers
-    # ─────────────────────────────────────────────────────
-
-    def _parse_python_params(self, code: str) -> dict:
-        tree = ast.parse(code)
-
-        for node in ast.walk(tree):
-            if isinstance(node, ast.FunctionDef):
-                params = []
-                args = node.args
-                num_args = len(args.args)
-                num_defaults = len(args.defaults)
-                num_without_default = num_args - num_defaults
-
-                for i, arg in enumerate(args.args):
-                    if arg.arg == "self":
-                        continue
-
-                    param = {
-                        "name": arg.arg,
-                        "required": i < num_without_default,
-                        "default": None,
-                        "type": None
-                    }
-
-                    default_index = i - num_without_default
-                    if default_index >= 0:
-                        default_node = args.defaults[default_index]
-                        if isinstance(default_node, ast.Constant):
-                            param["default"] = default_node.value
-
-                    if arg.annotation and isinstance(arg.annotation, ast.Name):
-                        param["type"] = arg.annotation.id
-
-                    params.append(param)
-
-                return {"function": node.name, "params": params}
-
-        raise Exception("No se encontró ninguna función en el código")
-
-    def _parse_js_params(self, service_id: str, code: str) -> dict:
-        """Usa acorn desde el contenedor para parsear parámetros de JS."""
-        
-        parse_script = """
-const acorn = require('acorn');
-const code = process.env.USER_CODE || '';
-
-try {
-    const ast = acorn.parse(code, { ecmaVersion: 2020, sourceType: 'script' });
-
-    function getParams(funcNode) {
-        return funcNode.params.map(param => {
-            if (param.type === 'AssignmentPattern') {
-                return {
-                    name: param.left.name,
-                    required: false,
-                    default: param.right.value ?? null,
-                    type: null
-                };
-            }
-            return { name: param.name, required: true, default: null, type: null };
-        });
-    }
-
-    for (const node of ast.body) {
-        if (node.type === 'FunctionDeclaration') {
-            console.log(JSON.stringify({ function: node.id.name, params: getParams(node) }));
-            process.exit(0);
-        }
-        if (
-            node.type === 'VariableDeclaration' &&
-            node.declarations[0].init &&
-            (
-                node.declarations[0].init.type === 'ArrowFunctionExpression' ||
-                node.declarations[0].init.type === 'FunctionExpression'
-            )
-        ) {
-            console.log(JSON.stringify({ function: node.declarations[0].id.name, params: getParams(node.declarations[0].init) }));
-            process.exit(0);
-        }
-    }
-    console.log(JSON.stringify({ error: 'No se encontró ninguna función' }));
-} catch(e) {
-    console.log(JSON.stringify({ error: e.message }));
-}
-"""
-        container_name = self.active_services[service_id]["container_name"]
-        container = self.client.containers.get(container_name)
-        result = container.exec_run(["node", "-e", parse_script])
-        
-        return json.loads(result.output.decode())
-
-    def _parse_params(self, service_id: str, code: str, language: str) -> dict:
-        """Delega al parser según el lenguaje."""
         try:
-            if language == "python":
-                return self._parse_python_params(code)
-            elif language == "javascript":
-                return self._parse_js_params(service_id, code)
-            else:
-                raise Exception(f"Lenguaje '{language}' no soportado")
+            container = self.client.containers.get(info["container_id"])
+            container.start()
+            self._wait_for_container(container, timeout=15)
+            info["status"] = "active"
+            print(f"⚡ Wake-on-request: {info['container_name']}")
         except Exception as e:
-            # Si falla el parser no rompemos la creación del microservicio
-            print(f"⚠️  [Parser] Error: {str(e)}")
-            return {"function": None, "params": []}
-
-    # ─────────────────────────────────────────────────────
-    # CRUD de microservicios
-    # ─────────────────────────────────────────────────────
+            raise RuntimeError(f"Cold start falló: {e}")
 
     def _wait_for_container(self, container, timeout: int = 10):
-        """Espera a que el contenedor esté en estado running."""
         start = time.time()
         while time.time() - start < timeout:
             container.reload()
@@ -238,89 +127,7 @@ try {
             time.sleep(0.5)
         raise Exception(f"Timeout esperando el contenedor {container.name}")
 
-    def create_microservice(self, name: str, code: str, language: str, description: str = "") -> dict:
-        """
-        Crea un contenedor usando la imagen base ya construida.
-        El código del usuario se inyecta como variable de entorno.
-        """
-        service_id = str(uuid.uuid4())[:8]
-        container_name = f"ms-{name}-{service_id}"
-        
-        # Usa la imagen base pre-construida según el lenguaje
-        images = {
-            "python": "ms-platform-python:latest",
-            "javascript": "ms-platform-javascript:latest"
-        }
-        image = images.get(language)
-        if not image:
-            raise Exception(f"Lenguaje '{language}' no soportado. Usa 'python' o 'javascript'.")
-
-        try:
-            container = self.client.containers.run(
-                image=image,
-                name=container_name,
-                # El código llega como variable de entorno, no hay build
-                environment={
-                    "USER_CODE": code,
-                    "SERVICE_NAME": name
-                },
-                network=self.network_name,
-                detach=True,
-                remove=False,
-                labels={
-                    "platform": "microservice-platform",
-                    "service_id": service_id
-                }
-            )
-
-            self._wait_for_container(container)
-
-            self.active_services[service_id] = {
-                "container_id": container.id,
-                "container_name": container_name,
-                "name": name,
-                "language": language,
-                "code": code,
-                "description": description,
-                "status": "active",
-                "endpoint": f"/api/services/{name}-{service_id}",
-                "function": None,
-                "params": []
-            }
-            
-            params_info = self._parse_params(service_id, code, language)
-            self.active_services[service_id]["function"] = params_info.get("function")
-            self.active_services[service_id]["params"] = params_info.get("params", [])
-            
-            
-            print(f"✅ Microservicio creado: {container_name}")
-            print(f"   Función: {params_info.get('function')}")
-            print(f"   Parámetros: {params_info.get('params')}")
-
-            return {
-                "service_id": service_id,
-                "container_name": container_name,
-                "endpoint": f"/api/services/{name}-{service_id}",
-                "function": params_info.get("function"),
-                "params": params_info.get("params", [])
-            }
-
-        except Exception as e:
-            raise Exception(f"Error creando contenedor: {str(e)}")
-
-    def get_service_params(self, service_id: str) -> dict:
-        """Retorna los parámetros ya almacenados, sin reparsear."""
-        if service_id not in self.active_services:
-            raise Exception(f"Microservicio '{service_id}' no encontrado")
-
-        service = self.active_services[service_id]
-        return {
-            "function": service.get("function"),
-            "params": service.get("params", [])
-        }
-
     def _stop_and_remove_container(self, container):
-        """Detiene y elimina un contenedor individual."""
         try:
             container.stop(timeout=3)
             container.remove(force=True)
@@ -332,70 +139,170 @@ try {
             except Exception as e2:
                 print(f"⚠️  Error forzando eliminación {container.name}: {e2}")
 
-    def stop_microservice(self, service_id: str):
-        """Detiene y elimina un microservicio."""
-        if service_id in self.active_services:
-            info = self.active_services[service_id]
+
+
+    def deploy_project(self, name: str, username: str, repo_url: str, container_type: str, port: int, description: str = "") -> dict:
+        """
+        Clona el repositorio del usuario y despliega el contenedor.
+        """
+        project_id = str(uuid.uuid4())[:8]
+        container_name = f"project-{username}-{name}-{project_id}"
+        image_tag = f"hosting-{username}-{name}:{project_id}"
+
+        tmp_dir = tempfile.mkdtemp()
+
+        try:
+            # Paso 1: Clonar el repositorio en una carpeta temporal
+            print(f"📥 Clonando repositorio: {repo_url}")
+            git.Repo.clone_from(repo_url, tmp_dir)
+            print(f"✅ Repositorio clonado en {tmp_dir}")
+
+            # Paso 2: Construir la imagen según el tipo de contenedor
+            if container_type == "dockerfile":
+                dockerfile_path = os.path.join(tmp_dir, "Dockerfile")
+                if not os.path.exists(dockerfile_path):
+                    raise Exception("No se encontró un Dockerfile en la raíz del repositorio")
+
+                print(f"🔨 Construyendo imagen desde Dockerfile...")
+                image, logs = self.client.images.build(
+                    path=tmp_dir,
+                    tag=image_tag,
+                    rm=True
+                )
+                for log in logs:
+                    if "stream" in log:
+                        print(log["stream"].strip())
+
+            elif container_type == "docker-compose":
+                raise Exception("docker-compose aún no está soportado en esta versión") #Se agrega después, ya que necesita diseño más complejo
+            else:
+                raise Exception(f"Tipo de contenedor '{container_type}' no soportado")
+
+            # Paso 3: Lanzar el contenedor con límites de recursos
+            print(f"🚀 Lanzando contenedor {container_name}...")
+            container = self.client.containers.run(
+                image=image_tag,
+                name=container_name,
+                network=self.network_name,
+                detach=True,
+                remove=False,
+                mem_limit="256m",
+                nano_cpus=500_000_000,
+                labels={
+                    "platform": "hosting-platform",
+                    "project_id": project_id,
+                    "username": username
+                }
+            )
+
+            self._wait_for_container(container)
+
+            # Paso 4: Registrar el proyecto en el estado activo
+            self.active_services[project_id] = {
+                "container_id": container.id,
+                "container_name": container_name,
+                "image_tag": image_tag,
+                "name": name,
+                "username": username,
+                "repo_url": repo_url,
+                "container_type": container_type,
+                "port": port,
+                "description": description,
+                "status": "active",
+                "last_active": time.time(),
+                "hostname": None,
+                "url": None,
+                "endpoint": f"http://{name}.{username}.localhost",
+            }
+
+            print(f"✅ Proyecto desplegado: {container_name}")
+
+            return {
+                "project_id": project_id,
+                "container_name": container_name,
+                "endpoint": f"http://{name}.{username}.localhost"
+            }
+
+        except Exception as e:
+            try:
+                self.client.images.remove(image_tag, force=True)
+            except:
+                pass
+            raise Exception(f"Error desplegando proyecto: {str(e)}")
+
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            print(f"🧹 Carpeta temporal eliminada")
+
+    def stop_project(self, project_id: str):
+        """Detiene y elimina un proyecto."""
+        if project_id in self.active_services:
+            info = self.active_services[project_id]
             try:
                 container = self.client.containers.get(info["container_id"])
                 self._stop_and_remove_container(container)
-                del self.active_services[service_id]
+                # Eliminar también la imagen construida
+                self.client.images.remove(info["image_tag"], force=True)
+                print(f"🗑️  Imagen eliminada: {info['image_tag']}")
             except docker.errors.NotFound:
-                # El contenedor ya no existe, solo limpiar el registro
-                del self.active_services[service_id]
+                pass
             except Exception as e:
-                print(f"Error deteniendo contenedor: {e}")
+                print(f"⚠️  Error deteniendo proyecto: {e}")
+            finally:
+                del self.active_services[project_id]
 
-    def enable_microservice(self, service_id: str):
-        # Inicia el contenedor de un microservicio deshabilitado.
-        if service_id not in self.active_services:
-            raise Exception(f"Microservicio '{service_id}' no encontrado")
-
-        info = self.active_services[service_id]
+    def enable_project(self, project_id: str):
+        """
+        Inicia un proyecto detenido manualmente (`inactive`) o por timeout
+        (`idle`) y refresca `last_active`.
+        """
+        if project_id not in self.active_services:
+            raise Exception(f"Proyecto '{project_id}' no encontrado")
+        info = self.active_services[project_id]
         try:
             container = self.client.containers.get(info["container_id"])
             container.start()
-            self.active_services[service_id]["status"] = "active"
-            print(f"✅ Microservicio habilitado: {info['container_name']}")
+            self._wait_for_container(container, timeout=15)
+            info["status"] = "active"
+            info["last_active"] = time.time()
+            print(f"✅ Proyecto habilitado: {info['container_name']}")
         except Exception as e:
-            raise Exception(f"Error habilitando microservicio: {str(e)}")
+            raise Exception(f"Error habilitando proyecto: {str(e)}")
 
-    def disable_microservice(self, service_id: str):
-        if service_id not in self.active_services:
-            raise Exception(f"Microservicio '{service_id}' no encontrado")
-
-        info = self.active_services[service_id]
+    def disable_project(self, project_id: str):
+        """
+        Detiene manualmente un proyecto. Marca `inactive` (distinto de
+        `idle`) para que el wake-on-request no lo resucite a espaldas
+        del usuario.
+        """
+        if project_id not in self.active_services:
+            raise Exception(f"Proyecto '{project_id}' no encontrado")
+        info = self.active_services[project_id]
         try:
             container = self.client.containers.get(info["container_id"])
             container.stop()
-            self.active_services[service_id]["status"] = "inactive"
-            print(f"✅ Microservicio deshabilitado: {info['container_name']}")
+            info["status"] = "inactive"
+            print(f"⏸️  Proyecto deshabilitado: {info['container_name']}")
         except Exception as e:
-            raise Exception(f"Error deshabilitando microservicio: {str(e)}")
+            raise Exception(f"Error deshabilitando proyecto: {str(e)}")
 
     def cleanup_all(self):
-        """Limpia todos los microservicios en paralelo al apagar la plataforma."""
-        
-        
-        self._stop_monitor()
-
+        """Limpia todos los proyectos al apagar la plataforma."""
         containers_to_remove = []
 
-        # Los registrados en active_services
-        for service_id, info in list(self.active_services.items()):
+        for project_id, info in list(self.active_services.items()):
             try:
                 container = self.client.containers.get(info["container_id"])
                 containers_to_remove.append(container)
             except docker.errors.NotFound:
                 pass
             except Exception as e:
-                print(f"⚠️  Error obteniendo contenedor {service_id}: {e}")
+                print(f"⚠️  Error obteniendo contenedor {project_id}: {e}")
 
-        # Los huérfanos (por si acaso)
         try:
             orphans = self.client.containers.list(
-            all=True,  
-            filters={"label": "platform=microservice-platform"}
+                all=True,
+                filters={"label": "platform=hosting-platform"}
             )
             for c in orphans:
                 if c not in containers_to_remove:
@@ -405,12 +312,10 @@ try {
 
         if not containers_to_remove:
             print("✅ No hay contenedores que limpiar")
-            self.active_services.clear()
             return
 
-        print(f"🗑️  Eliminando {len(containers_to_remove)} contenedor(es) en paralelo...")
+        print(f"🗑️  Eliminando {len(containers_to_remove)} contenedor(es)...")
 
-        # Eliminar todos en paralelo con threads
         threads = []
         for container in containers_to_remove:
             t = threading.Thread(
@@ -421,10 +326,8 @@ try {
             threads.append(t)
             t.start()
 
-        # Esperar a que todos terminen con timeout global
         for t in threads:
             t.join(timeout=10)
 
-        # Limpiar el registro
         self.active_services.clear()
         print("✅ Limpieza completa")
