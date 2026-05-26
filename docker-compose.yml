@@ -23,7 +23,7 @@ services:
       - NGINX_CONFIG_PATH=/nginx_locations
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock 
-      - nginx_locations:/nginx_locations  
+      - nginx_locations:/nginx_locations
     ports:
       - "8000:8000"
     networks:

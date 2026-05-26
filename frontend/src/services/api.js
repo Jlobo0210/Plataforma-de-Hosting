@@ -1,17 +1,19 @@
 // ─────────────────────────────────────────────────────────────
 //  api.js  –  Capa de datos para la Plataforma de Hosting
 //
-//  USE_MOCK = true  → usa datos locales de mockData.js
-//  USE_MOCK = false → llama al backend real (aún no construido)
+//  Modo híbrido:
+//    • Auth (getUser, login, logout) → mock local (TODO Roble)
+//    • Proyectos (getAll, getById, create, remove, toggle) →
+//      backend FastAPI real, con normalización snake_case ↔ camelCase
+//      y header X-Username derivado del usuario mock.
 //
-//  Cuando el backend esté listo, solo cambia USE_MOCK a false
-//  y ajusta BASE_URL al dominio/puerto correcto.
+//  Para volver al modo 100% mock (sin backend), poner USE_MOCK_PROJECTS = true.
 // ─────────────────────────────────────────────────────────────
 
-const USE_MOCK = true;  // ← Cambiar a false cuando el backend esté listo
-const BASE_URL = "/api/projects";  // ← Ajustar según el backend
-
 import { MOCK_PROJECTS, MOCK_USER } from "./mockData";
+
+const USE_MOCK_PROJECTS = false;
+const BASE_URL = "/api/projects";
 
 // ── Store mutable en memoria (solo para el mock) ─────────────
 let store = MOCK_PROJECTS.map((p) => ({ ...p }));
@@ -62,7 +64,9 @@ const mock = {
       name: data.name,
       githubUrl: data.githubUrl,
       containerType: data.containerType,  // "dockerfile" | "compose"
+      rootPath: data.rootPath || ".",
       port: Number(data.port),
+      envContent: data.envContent || "", 
       status: "building",
       enabled: true,
       assignedUrl: `http://${data.name}.${username}.localhost`,
@@ -123,86 +127,183 @@ const mock = {
     if (!found) return Promise.reject(new Error("Proyecto no encontrado"));
     return Promise.resolve({ ...found });
   },
+
+
+  updateEnv: (id, envContent) => {
+  store = store.map((s) => s.id === id ? { ...s, envContent } : s);
+  return Promise.resolve(store.find((s) => s.id === id));
+},
+
 };
 
 // ─────────────────────────────────────────────────────────────
-//  API REAL  –  Se activa cuando USE_MOCK = false
-//  Los endpoints siguen la convención REST que el backend
-//  deberá implementar. Ajusta según lo que acuerden en el equipo.
+//  Helpers de adaptación  ←→  backend FastAPI
 // ─────────────────────────────────────────────────────────────
-const api = {
-  /** GET /api/auth/me */
-  getUser: async () => {
-    const res = await fetch("/api/auth/me");
-    if (!res.ok) throw new Error(`Error ${res.status}`);
-    return res.json();
-  },
 
-  /** POST /api/auth/login  { email, password } */
-  login: async (email, password) => {
-    const res = await fetch("/api/auth/login", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ email, password }),
-    });
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      throw new Error(err.message || `Error ${res.status}`);
-    }
-    return res.json();
-  },
+/** Header obligatorio del backend (stub auth Roble). */
+function authHeaders() {
+  const username = currentUser?.username;
+  const headers = { "Content-Type": "application/json" };
+  if (username) headers["X-Username"] = username;
+  return headers;
+}
 
-  /** POST /api/auth/logout */
-  logout: async () => {
-    await fetch("/api/auth/logout", { method: "POST" });
-  },
+/**
+ * Mapeo de los tres estados del backend al modelo binario de la UI.
+ * `idle` (apagado por inactividad) se muestra como `active` porque el
+ * auth_request del NGINX revive el contenedor de forma transparente.
+ */
+const STATUS_MAP = {
+  active:   { enabled: true,  status: "active" },
+  idle:     { enabled: true,  status: "active" },
+  inactive: { enabled: false, status: "stopped" },
+};
 
-  /** GET /api/projects */
+/** Convierte un proyecto del backend (snake_case) al shape camelCase de la UI. */
+function normalizeProject(id, raw) {
+  const mapped = STATUS_MAP[raw.status] ?? { enabled: true, status: "active" };
+  const lastEpoch = typeof raw.last_active === "number" ? raw.last_active : null;
+  const lastIso = lastEpoch ? new Date(lastEpoch * 1000).toISOString() : new Date().toISOString();
+  return {
+    id,
+    name: raw.name,
+    githubUrl: raw.repo_url,
+    containerType: raw.container_type === "docker-compose" ? "compose" : raw.container_type,
+    rootPath: raw.root_path ?? ".",
+    envContent: raw.env_content ?? "",
+    port: raw.port,
+    description: raw.description ?? "",
+    enabled: mapped.enabled,
+    status: mapped.status,
+    assignedUrl:
+      raw.url ||
+      raw.endpoint ||
+      (raw.hostname ? `http://${raw.hostname}` : null),
+    createdAt: lastEpoch ? new Date(lastEpoch * 1000).toISOString() : null,
+    lastActivity: lastIso,
+    metrics: {
+      cpuPercent: 0,
+      memoryMB: 0,
+      memoryLimitMB: 256, // PDF: --memory 256m
+      requestsPerMin: 0,
+      requestsLimitPerMin: 60,
+    },
+  };
+}
+
+/** Convierte el body del modal (camelCase) al formato del backend (snake_case). */
+function denormalizeCreate(data) {
+  return {
+    name: data.name,
+    repo_url: data.githubUrl,
+    container_type: data.containerType === "compose" ? "docker-compose" : data.containerType,
+    port: Number(data.port),
+    description: data.description ?? "",
+    root_path: data.rootPath ?? ".",    
+    env_content: data.envContent ?? "", 
+  };
+}
+
+async function readError(res) {
+  try {
+    const body = await res.json();
+    return body.detail || body.message || `Error ${res.status}`;
+  } catch {
+    return `Error ${res.status}: ${res.statusText}`;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Proyectos contra el backend real
+// ─────────────────────────────────────────────────────────────
+const apiProjects = {
+  /** GET /api/projects → array normalizado */
   getAll: async () => {
-    const res = await fetch(BASE_URL);
-    if (!res.ok) throw new Error(`Error ${res.status}: ${res.statusText}`);
+    const res = await fetch(BASE_URL, { headers: authHeaders() });
+    if (!res.ok) throw new Error(await readError(res));
     const data = await res.json();
-    if (!Array.isArray(data?.projects)) return [];
-    return data.projects;
+    const map = data?.projects ?? {};
+    return Object.entries(map).map(([id, info]) => normalizeProject(id, info));
+  },
+
+  /** GET /api/projects/:id → proyecto normalizado */
+  getById: async (id) => {
+    const res = await fetch(`${BASE_URL}/${id}`, { headers: authHeaders() });
+    if (!res.ok) throw new Error(await readError(res));
+    return normalizeProject(id, await res.json());
   },
 
   /**
    * POST /api/projects
-   * Body: { name, githubUrl, containerType, port }
+   * Body UI: { name, githubUrl, containerType, port, description? }
+   * Tras crear, hace GET para devolver el proyecto completo (el POST
+   * solo retorna metadatos: project_id, hostname, url, message).
    */
   create: async (data) => {
+    const body = denormalizeCreate(data);
     const res = await fetch(BASE_URL, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(data),
+      headers: authHeaders(),
+      body: JSON.stringify(body),
     });
-    if (!res.ok) throw new Error(`Error ${res.status}: ${res.statusText}`);
-    return res.json();
+    if (!res.ok) throw new Error(await readError(res));
+    const meta = await res.json();
+    return apiProjects.getById(meta.project_id);
   },
 
   /** DELETE /api/projects/:id */
   remove: async (id) => {
-    const res = await fetch(`${BASE_URL}/${id}`, { method: "DELETE" });
-    if (!res.ok) throw new Error(`Error ${res.status}: ${res.statusText}`);
+    const res = await fetch(`${BASE_URL}/${id}`, {
+      method: "DELETE",
+      headers: authHeaders(),
+    });
+    if (!res.ok) throw new Error(await readError(res));
   },
 
   /**
-   * PATCH /api/projects/:id/start  ← enabled = true
-   * PATCH /api/projects/:id/stop   ← enabled = false
+   * PATCH /api/projects/:id/enable | /disable
+   * Devuelve el proyecto completo refrescado.
    */
   toggle: async (id, enabled) => {
-    const action = enabled ? "start" : "stop";
-    const res = await fetch(`${BASE_URL}/${id}/${action}`, { method: "PATCH" });
-    if (!res.ok) throw new Error(`Error ${res.status}: ${res.statusText}`);
-    return res.json();
+    const action = enabled ? "enable" : "disable";
+    const res = await fetch(`${BASE_URL}/${id}/${action}`, {
+      method: "PATCH",
+      headers: authHeaders(),
+    });
+    if (!res.ok) throw new Error(await readError(res));
+    return apiProjects.getById(id);
   },
 
-  /** GET /api/projects/:id */
-  getById: async (id) => {
-    const res = await fetch(`${BASE_URL}/${id}`);
-    if (!res.ok) throw new Error(`Error ${res.status}: ${res.statusText}`);
-    return res.json();
-  },
+  updateEnv: async (id, envContent) => {
+  const res = await fetch(`${BASE_URL}/${id}/env`, {
+    method: "PATCH",
+    headers: authHeaders(),
+    body: JSON.stringify({ env_content: envContent }),
+  });
+  if (!res.ok) throw new Error(await readError(res));
+  return apiProjects.getById(id);
+},
 };
 
-export default USE_MOCK ? mock : api;
+// ─────────────────────────────────────────────────────────────
+//  Export híbrido
+//    • Auth viene del mock (login con @uninorte.edu.co; setea currentUser)
+//    • Proyectos van al backend real con X-Username = currentUser.username
+//
+//  Si USE_MOCK_PROJECTS = true, se cae a 100% mock.
+// ─────────────────────────────────────────────────────────────
+export default {
+  getUser: mock.getUser,
+  login: mock.login,
+  logout: mock.logout,
+  ...(USE_MOCK_PROJECTS
+    ? {
+        getAll: mock.getAll,
+        getById: mock.getById,
+        create: mock.create,
+        remove: mock.remove,
+        toggle: mock.toggle,
+        updateEnv: mock.updateEnv, 
+      }
+    : apiProjects),
+};

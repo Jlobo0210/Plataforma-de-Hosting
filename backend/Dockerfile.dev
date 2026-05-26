@@ -11,6 +11,7 @@ RUN apt-get update && apt-get install -y \
     lsb-release \
     # Para inotify (ver cambios en archivos, opcional)
     inotify-tools \
+    git \
     && rm -rf /var/lib/apt/lists/*
 
 # ── Instalar Docker CLI (no el daemon, solo el cliente) ───────────────────────
