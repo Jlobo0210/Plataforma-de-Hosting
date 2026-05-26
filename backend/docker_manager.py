@@ -6,12 +6,127 @@ import threading
 import git
 import tempfile
 import shutil
+import urllib.request
+
+from env_utils import normalize_root_path, parse_env_content, write_build_env_files
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return int(raw)
+
+
+IDLE_TIMEOUT_SECONDS = _env_int("IDLE_TIMEOUT_SECONDS", 30 * 60)
+MONITOR_INTERVAL_SECONDS = _env_int("MONITOR_INTERVAL_SECONDS", 5)
+IDLE_WATCHER_INTERVAL_SECONDS = _env_int("IDLE_WATCHER_INTERVAL_SECONDS", 60)
+HTTP_READY_TIMEOUT_SECONDS = _env_int("HTTP_READY_TIMEOUT_SECONDS", 15)
+
 
 class DockerManager:
     def __init__(self):
         self.client = docker.from_env()
         self.network_name = os.getenv("DOCKER_NETWORK", "platform_network")
         self.active_services = {}
+        self._threads_started = False
+
+    def start_background_threads(self) -> None:
+        """
+        Arranca los hilos de monitoreo. Se invoca desde el lifespan de la
+        app, no desde __init__, para evitar que corran durante imports en
+        tests o durante el cleanup_all inicial.
+        """
+        if self._threads_started:
+            return
+        self._threads_started = True
+        threading.Thread(target=self._monitor_loop, daemon=True).start()
+        threading.Thread(target=self._idle_watcher, daemon=True).start()
+        print("👀 Hilos de monitoreo arrancados (status sync + idle watcher)")
+
+    def _monitor_loop(self):
+        """
+        Sincroniza periódicamente el campo `status` con el estado real
+        del contenedor en Docker. No sobreescribe `idle` ni `inactive`,
+        que son estados lógicos manejados por el watcher / el usuario.
+        """
+        while True:
+            for pid, info in list(self.active_services.items()):
+                try:
+                    container = self.client.containers.get(info["container_id"])
+                    container.reload()
+                    if info.get("status") in ("idle", "inactive"):
+                        continue
+                    info["status"] = "active" if container.status == "running" else "inactive"
+                except docker.errors.NotFound:
+                    info["status"] = "inactive"
+                except Exception as e:
+                    print(f"⚠️  [Monitor] Error revisando {info.get('container_name')}: {e}")
+            time.sleep(MONITOR_INTERVAL_SECONDS)
+
+    def _idle_watcher(self):
+        """Apaga contenedores con más de IDLE_TIMEOUT_SECONDS sin tráfico."""
+        while True:
+            now = time.time()
+            for pid, info in list(self.active_services.items()):
+                if info.get("status") != "active":
+                    continue
+                last = info.get("last_active", now)
+                if now - last > IDLE_TIMEOUT_SECONDS:
+                    self._idle_stop(pid)
+            time.sleep(IDLE_WATCHER_INTERVAL_SECONDS)
+
+    def _idle_stop(self, project_id: str):
+        info = self.active_services.get(project_id)
+        if not info:
+            return
+        try:
+            container = self.client.containers.get(info["container_id"])
+            container.stop(timeout=5)
+            info["status"] = "idle"
+            print(f"💤 Apagado por inactividad: {info['container_name']}")
+        except Exception as e:
+            print(f"⚠️  Error apagando por idle {info.get('container_name')}: {e}")
+
+    def _record_activity(self, project_id: str):
+        info = self.active_services.get(project_id)
+        if info is not None:
+            info["last_active"] = time.time()
+
+    def wake_project(self, project_id: str):
+        """
+        Garantiza que el contenedor del proyecto esté corriendo y refresca
+        `last_active`. Llamado por el endpoint `/_wake` desde NGINX en
+        cada request del usuario.
+
+        Excepciones:
+        - KeyError: el proyecto no existe (NGINX devolverá 500 al cliente).
+        - PermissionError: el dueño lo deshabilitó manualmente; no se
+          revive (NGINX devolverá 500; el dueño debe hacer PATCH /enable).
+        - RuntimeError: cold start falló (timeout, etc.).
+        """
+        if project_id not in self.active_services:
+            raise KeyError(project_id)
+
+        info = self.active_services[project_id]
+
+        if info.get("status") == "inactive":
+            raise PermissionError("Proyecto deshabilitado por el usuario")
+
+        self._record_activity(project_id)
+
+        if info.get("status") == "active":
+            return
+
+        try:
+            container = self.client.containers.get(info["container_id"])
+            container.start()
+            self._wait_for_container(container, timeout=15)
+            self._wait_for_http_ready(info["container_name"], info["port"])
+            info["status"] = "active"
+            print(f"⚡ Wake-on-request: {info['container_name']}")
+        except Exception as e:
+            raise RuntimeError(f"Cold start falló: {e}")
 
     def _wait_for_container(self, container, timeout: int = 10):
         start = time.time()
@@ -23,6 +138,24 @@ class DockerManager:
             print(f"⏳ Esperando contenedor {container.name} ({container.status})...")
             time.sleep(0.5)
         raise Exception(f"Timeout esperando el contenedor {container.name}")
+
+    def _wait_for_http_ready(self, container_name: str, port: int, timeout: int | None = None):
+        """Espera a que la app dentro del contenedor responda HTTP (evita 502 tras wake)."""
+        timeout = timeout or HTTP_READY_TIMEOUT_SECONDS
+        url = f"http://{container_name}:{port}/"
+        start = time.time()
+        last_error = "sin intentos"
+        while time.time() - start < timeout:
+            try:
+                req = urllib.request.Request(url, method="GET")
+                with urllib.request.urlopen(req, timeout=2) as resp:
+                    if resp.status < 500:
+                        print(f"✅ HTTP listo: {container_name}:{port}")
+                        return
+            except Exception as e:
+                last_error = str(e)
+            time.sleep(0.5)
+        raise Exception(f"Timeout esperando HTTP en {container_name}:{port} ({last_error})")
 
     def _stop_and_remove_container(self, container):
         try:
@@ -36,9 +169,97 @@ class DockerManager:
             except Exception as e2:
                 print(f"⚠️  Error forzando eliminación {container.name}: {e2}")
 
+    def _run_project_container(
+        self,
+        *,
+        image_tag: str,
+        container_name: str,
+        project_id: str,
+        username: str,
+        environment: dict[str, str] | None = None,
+    ):
+        run_kwargs = {
+            "image": image_tag,
+            "name": container_name,
+            "network": self.network_name,
+            "detach": True,
+            "remove": False,
+            "mem_limit": "256m",
+            "nano_cpus": 500_000_000,
+            "labels": {
+                "platform": "hosting-platform",
+                "project_id": project_id,
+                "username": username,
+            },
+        }
+        if environment:
+            run_kwargs["environment"] = environment
 
+        print(f"🚀 Lanzando contenedor {container_name}...")
+        container = self.client.containers.run(**run_kwargs)
+        self._wait_for_container(container)
+        return container
 
-    def deploy_project(self, name: str, username: str, repo_url: str, container_type: str, port: int, description: str = "") -> dict:
+    def _resolve_build_context(self, repo_root: str, normalized_root: str) -> str:
+        if normalized_root == ".":
+            return repo_root
+        return os.path.join(repo_root, normalized_root)
+
+    def _build_dockerfile_image(
+        self,
+        build_context: str,
+        image_tag: str,
+        env_content: str,
+        *,
+        normalized_root: str,
+        root_path: str,
+    ) -> None:
+        dockerfile_path = os.path.join(build_context, "Dockerfile")
+        if not os.path.isdir(build_context):
+            raise Exception(f"La ruta '{root_path}' no existe en el repositorio")
+        if not os.path.exists(dockerfile_path):
+            display_path = normalized_root if normalized_root != "." else "la raíz del repositorio"
+            raise Exception(f"No se encontró Dockerfile en '{display_path}'")
+
+        write_build_env_files(build_context, env_content)
+        parsed_env = parse_env_content(env_content)
+
+        build_kwargs = {
+            "path": build_context,
+            "tag": image_tag,
+            "rm": True,
+        }
+        if parsed_env:
+            build_kwargs["buildargs"] = parsed_env
+
+        print(f"🔨 Construyendo imagen desde Dockerfile en {normalized_root}...")
+        image, logs = self.client.images.build(**build_kwargs)
+        for log in logs:
+            if "stream" in log:
+                print(log["stream"].strip())
+
+    def _rebuild_project_image(self, info: dict, env_content: str, tmp_dir: str) -> None:
+        normalized_root = info.get("root_path", ".")
+        build_context = self._resolve_build_context(tmp_dir, normalized_root)
+        self._build_dockerfile_image(
+            build_context,
+            info["image_tag"],
+            env_content,
+            normalized_root=normalized_root,
+            root_path=normalized_root if normalized_root != "." else ".",
+        )
+
+    def deploy_project(
+        self,
+        name: str,
+        username: str,
+        repo_url: str,
+        container_type: str,
+        port: int,
+        description: str = "",
+        root_path: str = ".",
+        env_content: str = "",
+    ) -> dict:
         """
         Clona el repositorio del usuario y despliega el contenedor.
         """
@@ -47,6 +268,8 @@ class DockerManager:
         image_tag = f"hosting-{username}-{name}:{project_id}"
 
         tmp_dir = tempfile.mkdtemp()
+        normalized_root = normalize_root_path(root_path)
+        parsed_env = parse_env_content(env_content)
 
         try:
             # Paso 1: Clonar el repositorio en una carpeta temporal
@@ -54,21 +277,17 @@ class DockerManager:
             git.Repo.clone_from(repo_url, tmp_dir)
             print(f"✅ Repositorio clonado en {tmp_dir}")
 
+            build_context = self._resolve_build_context(tmp_dir, normalized_root)
+
             # Paso 2: Construir la imagen según el tipo de contenedor
             if container_type == "dockerfile":
-                dockerfile_path = os.path.join(tmp_dir, "Dockerfile")
-                if not os.path.exists(dockerfile_path):
-                    raise Exception("No se encontró un Dockerfile en la raíz del repositorio")
-
-                print(f"🔨 Construyendo imagen desde Dockerfile...")
-                image, logs = self.client.images.build(
-                    path=tmp_dir,
-                    tag=image_tag,
-                    rm=True
+                self._build_dockerfile_image(
+                    build_context,
+                    image_tag,
+                    env_content,
+                    normalized_root=normalized_root,
+                    root_path=root_path,
                 )
-                for log in logs:
-                    if "stream" in log:
-                        print(log["stream"].strip())
 
             elif container_type == "docker-compose":
                 raise Exception("docker-compose aún no está soportado en esta versión") #Se agrega después, ya que necesita diseño más complejo
@@ -76,23 +295,14 @@ class DockerManager:
                 raise Exception(f"Tipo de contenedor '{container_type}' no soportado")
 
             # Paso 3: Lanzar el contenedor con límites de recursos
-            print(f"🚀 Lanzando contenedor {container_name}...")
-            container = self.client.containers.run(
-                image=image_tag,
-                name=container_name,
-                network=self.network_name,
-                detach=True,
-                remove=False,
-                mem_limit="256m",
-                nano_cpus=500_000_000,
-                labels={
-                    "platform": "hosting-platform",
-                    "project_id": project_id,
-                    "username": username
-                }
+            container = self._run_project_container(
+                image_tag=image_tag,
+                container_name=container_name,
+                project_id=project_id,
+                username=username,
+                environment=parsed_env or None,
             )
-
-            self._wait_for_container(container)
+            self._wait_for_http_ready(container_name, port)
 
             # Paso 4: Registrar el proyecto en el estado activo
             self.active_services[project_id] = {
@@ -105,8 +315,13 @@ class DockerManager:
                 "container_type": container_type,
                 "port": port,
                 "description": description,
+                "root_path": normalized_root,
+                "env_content": env_content,
                 "status": "active",
-                "endpoint": f"http://{name}.{username}.localhost"
+                "last_active": time.time(),
+                "hostname": None,
+                "url": None,
+                "endpoint": f"http://{name}.{username}.localhost",
             }
 
             print(f"✅ Proyecto desplegado: {container_name}")
@@ -146,27 +361,79 @@ class DockerManager:
                 del self.active_services[project_id]
 
     def enable_project(self, project_id: str):
-        """Inicia un proyecto detenido."""
+        """
+        Inicia un proyecto detenido manualmente (`inactive`) o por timeout
+        (`idle`) y refresca `last_active`.
+        """
         if project_id not in self.active_services:
             raise Exception(f"Proyecto '{project_id}' no encontrado")
         info = self.active_services[project_id]
         try:
             container = self.client.containers.get(info["container_id"])
             container.start()
-            self.active_services[project_id]["status"] = "active"
+            self._wait_for_container(container, timeout=15)
+            self._wait_for_http_ready(info["container_name"], info["port"])
+            info["status"] = "active"
+            info["last_active"] = time.time()
             print(f"✅ Proyecto habilitado: {info['container_name']}")
         except Exception as e:
             raise Exception(f"Error habilitando proyecto: {str(e)}")
 
+    def update_project_env(self, project_id: str, env_content: str):
+        """Actualiza el .env del proyecto reconstruyendo la imagen y recreando el contenedor."""
+        if project_id not in self.active_services:
+            raise Exception(f"Proyecto '{project_id}' no encontrado")
+
+        info = self.active_services[project_id]
+        parsed_env = parse_env_content(env_content)
+        info["env_content"] = env_content
+
+        if info.get("container_type") != "dockerfile":
+            raise Exception("Actualizar variables solo está soportado para proyectos Dockerfile")
+
+        tmp_dir = tempfile.mkdtemp()
+        try:
+            print(f"📥 Re-clonando repositorio para rebuild: {info['repo_url']}")
+            git.Repo.clone_from(info["repo_url"], tmp_dir)
+
+            try:
+                container = self.client.containers.get(info["container_id"])
+                self._stop_and_remove_container(container)
+            except docker.errors.NotFound:
+                pass
+
+            self._rebuild_project_image(info, env_content, tmp_dir)
+
+            container = self._run_project_container(
+                image_tag=info["image_tag"],
+                container_name=info["container_name"],
+                project_id=project_id,
+                username=info["username"],
+                environment=parsed_env or None,
+            )
+
+            info["container_id"] = container.id
+            info["status"] = "active"
+            info["last_active"] = time.time()
+            print(f"♻️  Variables de entorno actualizadas (rebuild): {info['container_name']}")
+        except Exception as e:
+            raise Exception(f"Error actualizando variables de entorno: {str(e)}")
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
     def disable_project(self, project_id: str):
-        """Detiene un proyecto sin eliminarlo."""
+        """
+        Detiene manualmente un proyecto. Marca `inactive` (distinto de
+        `idle`) para que el wake-on-request no lo resucite a espaldas
+        del usuario.
+        """
         if project_id not in self.active_services:
             raise Exception(f"Proyecto '{project_id}' no encontrado")
         info = self.active_services[project_id]
         try:
             container = self.client.containers.get(info["container_id"])
             container.stop()
-            self.active_services[project_id]["status"] = "inactive"
+            info["status"] = "inactive"
             print(f"⏸️  Proyecto deshabilitado: {info['container_name']}")
         except Exception as e:
             raise Exception(f"Error deshabilitando proyecto: {str(e)}")
