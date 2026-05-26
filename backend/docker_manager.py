@@ -7,6 +7,8 @@ import git
 import tempfile
 import shutil
 
+from env_utils import normalize_root_path, parse_env_content, write_build_env_files
+
 
 IDLE_TIMEOUT_SECONDS = 30 * 60  # PDF: apagar contenedores tras 30 min sin tráfico
 MONITOR_INTERVAL_SECONDS = 5
@@ -139,9 +141,97 @@ class DockerManager:
             except Exception as e2:
                 print(f"⚠️  Error forzando eliminación {container.name}: {e2}")
 
+    def _run_project_container(
+        self,
+        *,
+        image_tag: str,
+        container_name: str,
+        project_id: str,
+        username: str,
+        environment: dict[str, str] | None = None,
+    ):
+        run_kwargs = {
+            "image": image_tag,
+            "name": container_name,
+            "network": self.network_name,
+            "detach": True,
+            "remove": False,
+            "mem_limit": "256m",
+            "nano_cpus": 500_000_000,
+            "labels": {
+                "platform": "hosting-platform",
+                "project_id": project_id,
+                "username": username,
+            },
+        }
+        if environment:
+            run_kwargs["environment"] = environment
 
+        print(f"🚀 Lanzando contenedor {container_name}...")
+        container = self.client.containers.run(**run_kwargs)
+        self._wait_for_container(container)
+        return container
 
-    def deploy_project(self, name: str, username: str, repo_url: str, container_type: str, port: int, description: str = "") -> dict:
+    def _resolve_build_context(self, repo_root: str, normalized_root: str) -> str:
+        if normalized_root == ".":
+            return repo_root
+        return os.path.join(repo_root, normalized_root)
+
+    def _build_dockerfile_image(
+        self,
+        build_context: str,
+        image_tag: str,
+        env_content: str,
+        *,
+        normalized_root: str,
+        root_path: str,
+    ) -> None:
+        dockerfile_path = os.path.join(build_context, "Dockerfile")
+        if not os.path.isdir(build_context):
+            raise Exception(f"La ruta '{root_path}' no existe en el repositorio")
+        if not os.path.exists(dockerfile_path):
+            display_path = normalized_root if normalized_root != "." else "la raíz del repositorio"
+            raise Exception(f"No se encontró Dockerfile en '{display_path}'")
+
+        write_build_env_files(build_context, env_content)
+        parsed_env = parse_env_content(env_content)
+
+        build_kwargs = {
+            "path": build_context,
+            "tag": image_tag,
+            "rm": True,
+        }
+        if parsed_env:
+            build_kwargs["buildargs"] = parsed_env
+
+        print(f"🔨 Construyendo imagen desde Dockerfile en {normalized_root}...")
+        image, logs = self.client.images.build(**build_kwargs)
+        for log in logs:
+            if "stream" in log:
+                print(log["stream"].strip())
+
+    def _rebuild_project_image(self, info: dict, env_content: str, tmp_dir: str) -> None:
+        normalized_root = info.get("root_path", ".")
+        build_context = self._resolve_build_context(tmp_dir, normalized_root)
+        self._build_dockerfile_image(
+            build_context,
+            info["image_tag"],
+            env_content,
+            normalized_root=normalized_root,
+            root_path=normalized_root if normalized_root != "." else ".",
+        )
+
+    def deploy_project(
+        self,
+        name: str,
+        username: str,
+        repo_url: str,
+        container_type: str,
+        port: int,
+        description: str = "",
+        root_path: str = ".",
+        env_content: str = "",
+    ) -> dict:
         """
         Clona el repositorio del usuario y despliega el contenedor.
         """
@@ -150,6 +240,8 @@ class DockerManager:
         image_tag = f"hosting-{username}-{name}:{project_id}"
 
         tmp_dir = tempfile.mkdtemp()
+        normalized_root = normalize_root_path(root_path)
+        parsed_env = parse_env_content(env_content)
 
         try:
             # Paso 1: Clonar el repositorio en una carpeta temporal
@@ -157,21 +249,17 @@ class DockerManager:
             git.Repo.clone_from(repo_url, tmp_dir)
             print(f"✅ Repositorio clonado en {tmp_dir}")
 
+            build_context = self._resolve_build_context(tmp_dir, normalized_root)
+
             # Paso 2: Construir la imagen según el tipo de contenedor
             if container_type == "dockerfile":
-                dockerfile_path = os.path.join(tmp_dir, "Dockerfile")
-                if not os.path.exists(dockerfile_path):
-                    raise Exception("No se encontró un Dockerfile en la raíz del repositorio")
-
-                print(f"🔨 Construyendo imagen desde Dockerfile...")
-                image, logs = self.client.images.build(
-                    path=tmp_dir,
-                    tag=image_tag,
-                    rm=True
+                self._build_dockerfile_image(
+                    build_context,
+                    image_tag,
+                    env_content,
+                    normalized_root=normalized_root,
+                    root_path=root_path,
                 )
-                for log in logs:
-                    if "stream" in log:
-                        print(log["stream"].strip())
 
             elif container_type == "docker-compose":
                 raise Exception("docker-compose aún no está soportado en esta versión") #Se agrega después, ya que necesita diseño más complejo
@@ -179,23 +267,13 @@ class DockerManager:
                 raise Exception(f"Tipo de contenedor '{container_type}' no soportado")
 
             # Paso 3: Lanzar el contenedor con límites de recursos
-            print(f"🚀 Lanzando contenedor {container_name}...")
-            container = self.client.containers.run(
-                image=image_tag,
-                name=container_name,
-                network=self.network_name,
-                detach=True,
-                remove=False,
-                mem_limit="256m",
-                nano_cpus=500_000_000,
-                labels={
-                    "platform": "hosting-platform",
-                    "project_id": project_id,
-                    "username": username
-                }
+            container = self._run_project_container(
+                image_tag=image_tag,
+                container_name=container_name,
+                project_id=project_id,
+                username=username,
+                environment=parsed_env or None,
             )
-
-            self._wait_for_container(container)
 
             # Paso 4: Registrar el proyecto en el estado activo
             self.active_services[project_id] = {
@@ -208,6 +286,8 @@ class DockerManager:
                 "container_type": container_type,
                 "port": port,
                 "description": description,
+                "root_path": normalized_root,
+                "env_content": env_content,
                 "status": "active",
                 "last_active": time.time(),
                 "hostname": None,
@@ -268,6 +348,48 @@ class DockerManager:
             print(f"✅ Proyecto habilitado: {info['container_name']}")
         except Exception as e:
             raise Exception(f"Error habilitando proyecto: {str(e)}")
+
+    def update_project_env(self, project_id: str, env_content: str):
+        """Actualiza el .env del proyecto reconstruyendo la imagen y recreando el contenedor."""
+        if project_id not in self.active_services:
+            raise Exception(f"Proyecto '{project_id}' no encontrado")
+
+        info = self.active_services[project_id]
+        parsed_env = parse_env_content(env_content)
+        info["env_content"] = env_content
+
+        if info.get("container_type") != "dockerfile":
+            raise Exception("Actualizar variables solo está soportado para proyectos Dockerfile")
+
+        tmp_dir = tempfile.mkdtemp()
+        try:
+            print(f"📥 Re-clonando repositorio para rebuild: {info['repo_url']}")
+            git.Repo.clone_from(info["repo_url"], tmp_dir)
+
+            try:
+                container = self.client.containers.get(info["container_id"])
+                self._stop_and_remove_container(container)
+            except docker.errors.NotFound:
+                pass
+
+            self._rebuild_project_image(info, env_content, tmp_dir)
+
+            container = self._run_project_container(
+                image_tag=info["image_tag"],
+                container_name=info["container_name"],
+                project_id=project_id,
+                username=info["username"],
+                environment=parsed_env or None,
+            )
+
+            info["container_id"] = container.id
+            info["status"] = "active"
+            info["last_active"] = time.time()
+            print(f"♻️  Variables de entorno actualizadas (rebuild): {info['container_name']}")
+        except Exception as e:
+            raise Exception(f"Error actualizando variables de entorno: {str(e)}")
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
     def disable_project(self, project_id: str):
         """

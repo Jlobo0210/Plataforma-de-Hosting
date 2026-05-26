@@ -12,7 +12,7 @@
 
 import { MOCK_PROJECTS, MOCK_USER } from "./mockData";
 
-const USE_MOCK_PROJECTS = true;
+const USE_MOCK_PROJECTS = false;
 const BASE_URL = "/api/projects";
 
 // ── Store mutable en memoria (solo para el mock) ─────────────
@@ -169,6 +169,8 @@ function normalizeProject(id, raw) {
     name: raw.name,
     githubUrl: raw.repo_url,
     containerType: raw.container_type === "docker-compose" ? "compose" : raw.container_type,
+    rootPath: raw.root_path ?? ".",
+    envContent: raw.env_content ?? "",
     port: raw.port,
     description: raw.description ?? "",
     enabled: mapped.enabled,

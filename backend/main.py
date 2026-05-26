@@ -69,6 +69,12 @@ class CreateProjectRequest(BaseModel):
     container_type: str  # "dockerfile" (docker-compose pendiente)
     port: int
     description: str = ""
+    root_path: str = "."
+    env_content: str = ""
+
+
+class UpdateEnvRequest(BaseModel):
+    env_content: str = ""
 
 
 @app.post("/api/projects")
@@ -94,6 +100,8 @@ async def create_project(
             container_type=request.container_type,
             port=request.port,
             description=request.description,
+            root_path=request.root_path,
+            env_content=request.env_content,
         )
 
         hostname = nginx_mgr.add_project_route(
@@ -119,6 +127,8 @@ async def create_project(
         }
     except HTTPException:
         raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -167,6 +177,23 @@ async def disable_project(project_id: str, username: str = Depends(get_username)
     try:
         docker_mgr.disable_project(project_id)
         return {"success": True, "status": "inactive"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.patch("/api/projects/{project_id}/env")
+async def update_project_env(
+    project_id: str,
+    request: UpdateEnvRequest,
+    username: str = Depends(get_username),
+):
+    """Actualiza las variables de entorno del proyecto recreando el contenedor."""
+    _require_owner(project_id, username)
+    try:
+        docker_mgr.update_project_env(project_id, request.env_content)
+        return docker_mgr.active_services[project_id]
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
