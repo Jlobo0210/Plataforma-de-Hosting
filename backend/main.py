@@ -12,16 +12,15 @@ nginx_mgr = NginxManager()
 # Limpieza al iniciar y apagar
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Limpiar microservicios huérfanos
+    # Al iniciar: limpiar microservicios huérfanos
     nginx_mgr.cleanup_all()
     docker_mgr.cleanup_all()
-    docker_mgr._start_monitor()
     yield
     # Al apagar: limpiar todo
     print("🔄 Apagando plataforma, limpiando microservicios...")
     cleanup_thread = threading.Thread(target=_cleanup)
     cleanup_thread.start()
-    cleanup_thread.join(timeout=30)  
+    cleanup_thread.join(timeout=30)  # Espera hasta 30 segundos para limpiar
     print("✅ Plataforma apagada")
 
 def _cleanup():
@@ -37,29 +36,32 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-class CreateServiceRequest(BaseModel):
+class CreateProjectRequest(BaseModel):
     name: str
-    code: str
-    language: str  # "python" | "javascript"
-    description: str = ""  
+    repo_url: str    # URL del repositorio de GitHub
+    container_type: str  # "dockerfile" o "docker-compose"
+    port: int        # Puerto que el microservicio expondrá
+    description: str = ""  # Opcional, para futuras mejoras
 
-@app.post("/api/services")
-async def create_service(request: CreateServiceRequest):
-    """Crea un nuevo microservicio."""
+@app.post("/api/projects")
+async def create_project(request: CreateProjectRequest, username: str = "testuser"): # Temporal, el username vendría del token de autenticación Roble
+    """Despliega un nuevo proyecto desde un repositorio de GitHub"""
     try:
         # 1. Crear el contenedor
-        service_info = docker_mgr.create_microservice(
+        project_info = docker_mgr.deploy_project(
             name=request.name,
-            code=request.code,
-            language=request.language,
+            username=username,
+            repo_url=request.repo_url,
+            container_type=request.container_type,
+            port=request.port,
             description=request.description
         )
         
         # 2. Agregar ruta en NGINX
         nginx_mgr.add_route(
-            service_id=service_info["service_id"],
-            container_name=service_info["container_name"],
-            endpoint=f"{request.name}-{service_info['service_id']}"
+            service_id=project_info["project_id"],
+            container_name=project_info["container_name"],
+            endpoint=f"{request.name}.{username}"
         )
 
         url = f"http://{hostname}"
@@ -72,48 +74,39 @@ async def create_service(request: CreateServiceRequest):
 
         return {
             "success": True,
-            "service_id": service_info["service_id"],
-            "endpoint": service_info["endpoint"],
-            "message": f"Microservicio disponible en {service_info['endpoint']}"
+            "project_id": project_info["project_id"],
+            "endpoint": project_info["endpoint"],
+            "message": f"Proyecto disponible en {project_info['endpoint']}"
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.delete("/api/services/{service_id}")
-async def delete_service(service_id: str):
-    """Elimina un microservicio."""
-    docker_mgr.stop_microservice(service_id)
-    nginx_mgr.remove_route(service_id)
+@app.get("/api/projects")
+async def list_projects():
+    """Lista todos los proyectos activos."""
+    return {"projects": docker_mgr.active_services}
+
+@app.delete("/api/projects/{project_id}")
+async def delete_project(project_id: str):
+    """Elimina un proyecto y su contenedor."""
+    docker_mgr.stop_project(project_id)
+    nginx_mgr.remove_route(project_id)
     return {"success": True}
 
-@app.patch("/api/services/{service_id}/enable")
-async def enable_service(service_id: str):
-    # Habilita un microservicio detenido.
+@app.patch("/api/projects/{project_id}/enable")
+async def enable_project(project_id: str):
+    """Habilita un proyecto detenido."""
     try:
-        docker_mgr.enable_microservice(service_id)
+        docker_mgr.enable_project(project_id)
         return {"success": True, "status": "active"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-    
-@app.patch("/api/services/{service_id}/disable")
-async def disable_service(service_id: str):
-    # Deshabilita un microservicio sin eliminarlo.
+
+@app.patch("/api/projects/{project_id}/disable")
+async def disable_project(project_id: str):
+    """Deshabilita un proyecto sin eliminarlo."""
     try:
-        docker_mgr.disable_microservice(service_id)
+        docker_mgr.disable_project(project_id)
         return {"success": True, "status": "inactive"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/api/services")
-async def list_services():
-    """Lista los microservicios activos."""
-    return {"services": docker_mgr.active_services}
-
-@app.get("/api/services/{service_id}/params")
-async def get_service_params(service_id: str):
-    """Retorna los parámetros que necesita un microservicio."""
-    try:
-        params = docker_mgr.get_service_params(service_id)
-        return params
-    except Exception as e:
-        raise HTTPException(status_code=404, detail=str(e))
