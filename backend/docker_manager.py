@@ -7,11 +7,114 @@ import git
 import tempfile
 import shutil
 
+
+IDLE_TIMEOUT_SECONDS = 30 * 60  # PDF: apagar contenedores tras 30 min sin tráfico
+MONITOR_INTERVAL_SECONDS = 5
+IDLE_WATCHER_INTERVAL_SECONDS = 60
+
+
 class DockerManager:
     def __init__(self):
         self.client = docker.from_env()
         self.network_name = os.getenv("DOCKER_NETWORK", "platform_network")
         self.active_services = {}
+        self._threads_started = False
+
+    def start_background_threads(self) -> None:
+        """
+        Arranca los hilos de monitoreo. Se invoca desde el lifespan de la
+        app, no desde __init__, para evitar que corran durante imports en
+        tests o durante el cleanup_all inicial.
+        """
+        if self._threads_started:
+            return
+        self._threads_started = True
+        threading.Thread(target=self._monitor_loop, daemon=True).start()
+        threading.Thread(target=self._idle_watcher, daemon=True).start()
+        print("👀 Hilos de monitoreo arrancados (status sync + idle watcher)")
+
+    def _monitor_loop(self):
+        """
+        Sincroniza periódicamente el campo `status` con el estado real
+        del contenedor en Docker. No sobreescribe `idle` ni `inactive`,
+        que son estados lógicos manejados por el watcher / el usuario.
+        """
+        while True:
+            for pid, info in list(self.active_services.items()):
+                try:
+                    container = self.client.containers.get(info["container_id"])
+                    container.reload()
+                    if info.get("status") in ("idle", "inactive"):
+                        continue
+                    info["status"] = "active" if container.status == "running" else "inactive"
+                except docker.errors.NotFound:
+                    info["status"] = "inactive"
+                except Exception as e:
+                    print(f"⚠️  [Monitor] Error revisando {info.get('container_name')}: {e}")
+            time.sleep(MONITOR_INTERVAL_SECONDS)
+
+    def _idle_watcher(self):
+        """Apaga contenedores con más de IDLE_TIMEOUT_SECONDS sin tráfico."""
+        while True:
+            now = time.time()
+            for pid, info in list(self.active_services.items()):
+                if info.get("status") != "active":
+                    continue
+                last = info.get("last_active", now)
+                if now - last > IDLE_TIMEOUT_SECONDS:
+                    self._idle_stop(pid)
+            time.sleep(IDLE_WATCHER_INTERVAL_SECONDS)
+
+    def _idle_stop(self, project_id: str):
+        info = self.active_services.get(project_id)
+        if not info:
+            return
+        try:
+            container = self.client.containers.get(info["container_id"])
+            container.stop(timeout=5)
+            info["status"] = "idle"
+            print(f"💤 Apagado por inactividad: {info['container_name']}")
+        except Exception as e:
+            print(f"⚠️  Error apagando por idle {info.get('container_name')}: {e}")
+
+    def _record_activity(self, project_id: str):
+        info = self.active_services.get(project_id)
+        if info is not None:
+            info["last_active"] = time.time()
+
+    def wake_project(self, project_id: str):
+        """
+        Garantiza que el contenedor del proyecto esté corriendo y refresca
+        `last_active`. Llamado por el endpoint `/_wake` desde NGINX en
+        cada request del usuario.
+
+        Excepciones:
+        - KeyError: el proyecto no existe (NGINX devolverá 500 al cliente).
+        - PermissionError: el dueño lo deshabilitó manualmente; no se
+          revive (NGINX devolverá 500; el dueño debe hacer PATCH /enable).
+        - RuntimeError: cold start falló (timeout, etc.).
+        """
+        if project_id not in self.active_services:
+            raise KeyError(project_id)
+
+        info = self.active_services[project_id]
+
+        if info.get("status") == "inactive":
+            raise PermissionError("Proyecto deshabilitado por el usuario")
+
+        self._record_activity(project_id)
+
+        if info.get("status") == "active":
+            return
+
+        try:
+            container = self.client.containers.get(info["container_id"])
+            container.start()
+            self._wait_for_container(container, timeout=15)
+            info["status"] = "active"
+            print(f"⚡ Wake-on-request: {info['container_name']}")
+        except Exception as e:
+            raise RuntimeError(f"Cold start falló: {e}")
 
     def _wait_for_container(self, container, timeout: int = 10):
         start = time.time()
@@ -106,7 +209,10 @@ class DockerManager:
                 "port": port,
                 "description": description,
                 "status": "active",
-                "endpoint": f"http://{name}.{username}.localhost"
+                "last_active": time.time(),
+                "hostname": None,
+                "url": None,
+                "endpoint": f"http://{name}.{username}.localhost",
             }
 
             print(f"✅ Proyecto desplegado: {container_name}")
@@ -146,27 +252,36 @@ class DockerManager:
                 del self.active_services[project_id]
 
     def enable_project(self, project_id: str):
-        """Inicia un proyecto detenido."""
+        """
+        Inicia un proyecto detenido manualmente (`inactive`) o por timeout
+        (`idle`) y refresca `last_active`.
+        """
         if project_id not in self.active_services:
             raise Exception(f"Proyecto '{project_id}' no encontrado")
         info = self.active_services[project_id]
         try:
             container = self.client.containers.get(info["container_id"])
             container.start()
-            self.active_services[project_id]["status"] = "active"
+            self._wait_for_container(container, timeout=15)
+            info["status"] = "active"
+            info["last_active"] = time.time()
             print(f"✅ Proyecto habilitado: {info['container_name']}")
         except Exception as e:
             raise Exception(f"Error habilitando proyecto: {str(e)}")
 
     def disable_project(self, project_id: str):
-        """Detiene un proyecto sin eliminarlo."""
+        """
+        Detiene manualmente un proyecto. Marca `inactive` (distinto de
+        `idle`) para que el wake-on-request no lo resucite a espaldas
+        del usuario.
+        """
         if project_id not in self.active_services:
             raise Exception(f"Proyecto '{project_id}' no encontrado")
         info = self.active_services[project_id]
         try:
             container = self.client.containers.get(info["container_id"])
             container.stop()
-            self.active_services[project_id]["status"] = "inactive"
+            info["status"] = "inactive"
             print(f"⏸️  Proyecto deshabilitado: {info['container_name']}")
         except Exception as e:
             raise Exception(f"Error deshabilitando proyecto: {str(e)}")
