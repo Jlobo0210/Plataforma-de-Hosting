@@ -12,7 +12,7 @@
 
 import { MOCK_PROJECTS, MOCK_USER } from "./mockData";
 
-const USE_MOCK_PROJECTS = false;
+const USE_MOCK_PROJECTS = true;
 const BASE_URL = "/api/projects";
 
 // ── Store mutable en memoria (solo para el mock) ─────────────
@@ -64,7 +64,9 @@ const mock = {
       name: data.name,
       githubUrl: data.githubUrl,
       containerType: data.containerType,  // "dockerfile" | "compose"
+      rootPath: data.rootPath || ".",
       port: Number(data.port),
+      envContent: data.envContent || "", 
       status: "building",
       enabled: true,
       assignedUrl: `http://${data.name}.${username}.localhost`,
@@ -125,6 +127,13 @@ const mock = {
     if (!found) return Promise.reject(new Error("Proyecto no encontrado"));
     return Promise.resolve({ ...found });
   },
+
+
+  updateEnv: (id, envContent) => {
+  store = store.map((s) => s.id === id ? { ...s, envContent } : s);
+  return Promise.resolve(store.find((s) => s.id === id));
+},
+
 };
 
 // ─────────────────────────────────────────────────────────────
@@ -188,6 +197,8 @@ function denormalizeCreate(data) {
     container_type: data.containerType === "compose" ? "docker-compose" : data.containerType,
     port: Number(data.port),
     description: data.description ?? "",
+    root_path: data.rootPath ?? ".",    
+    env_content: data.envContent ?? "", 
   };
 }
 
@@ -260,6 +271,16 @@ const apiProjects = {
     if (!res.ok) throw new Error(await readError(res));
     return apiProjects.getById(id);
   },
+
+  updateEnv: async (id, envContent) => {
+  const res = await fetch(`${BASE_URL}/${id}/env`, {
+    method: "PATCH",
+    headers: authHeaders(),
+    body: JSON.stringify({ env_content: envContent }),
+  });
+  if (!res.ok) throw new Error(await readError(res));
+  return apiProjects.getById(id);
+},
 };
 
 // ─────────────────────────────────────────────────────────────
@@ -280,6 +301,7 @@ export default {
         create: mock.create,
         remove: mock.remove,
         toggle: mock.toggle,
+        updateEnv: mock.updateEnv, 
       }
     : apiProjects),
 };

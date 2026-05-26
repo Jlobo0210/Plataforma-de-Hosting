@@ -14,7 +14,9 @@ const EMPTY = {
   name: "",
   githubUrl: "",
   containerType: "dockerfile",  // "dockerfile" | "compose"
+  rootPath: ".",
   port: "",
+  envContent: "",
 };
 
 // Puerto TCP del contenedor: cualquier valor 1-65535 vale.
@@ -78,7 +80,9 @@ export default function CreateServiceModal({ isOpen, user, onClose, onSubmit }) 
         name: form.name,
         githubUrl: form.githubUrl.trim(),
         containerType: form.containerType,
+        rootPath: form.rootPath.trim() || ".",
         port: Number(form.port),
+        envContent: form.envContent,
       });
       setForm(EMPTY);
       onClose();
@@ -206,8 +210,60 @@ export default function CreateServiceModal({ isOpen, user, onClose, onSubmit }) 
             </div>
           </div>
 
-          {/* ── Puerto ─────────────────────────────── */}
+          {/* ── Ruta raíz del proyecto ──────────────── */}
           <div>
+            <label className="text-xs font-semibold text-slate-400 uppercase tracking-wider">
+              Ruta raíz del proyecto
+            </label>
+            <p className="text-xs text-slate-600 mt-0.5 mb-1.5">
+              Carpeta donde está el Dockerfile o docker-compose.yml dentro del repo. Útil para monorepos.
+            </p>
+            <div className="relative">
+              <span className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-600 text-sm font-mono select-none">
+                ./
+              </span>
+              <input
+                value={form.rootPath === "." ? "" : form.rootPath.replace(/^\.\//, "")}
+                onChange={(e) => {
+                  const v = e.target.value.trim();
+                  set("rootPath", v ? `./${v}` : ".");
+                }}
+                placeholder="frontend   (vacío = raíz del repo)"
+                className="w-full bg-slate-800 border border-slate-700 rounded-lg pl-7 pr-3 py-2.5 text-sm font-mono text-slate-200 focus:outline-none focus:border-cyan-600 placeholder:text-slate-600 transition-colors"
+              />
+            </div>
+            {form.rootPath && form.rootPath !== "." && (
+              <p className="text-xs text-slate-500 font-mono mt-1">
+                Ruta: <span className="text-cyan-400">{form.rootPath}</span>
+              </p>
+            )}
+          </div>
+
+          {/* ── Variables de entorno (.env) ─────────── */}
+          <div>
+            <label className="text-xs font-semibold text-slate-400 uppercase tracking-wider">
+              Variables de entorno
+              <span className="ml-2 text-slate-600 normal-case font-normal">(opcional)</span>
+            </label>
+            <p className="text-xs text-slate-600 mt-0.5 mb-1.5">
+              Pega el contenido de tu <span className="font-mono">.env</span> directamente. El backend lo inyectará al contenedor.
+            </p>
+            <textarea
+              value={form.envContent}
+              onChange={(e) => set("envContent", e.target.value)}
+              rows={5}
+              placeholder={"NODE_ENV=production\nPORT=3000\nDB_URL=postgres://...\nSECRET_KEY=..."}
+              spellCheck={false}
+              className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2.5 text-xs font-mono text-emerald-400 focus:outline-none focus:border-cyan-600 placeholder:text-slate-700 resize-y transition-colors leading-relaxed"
+            />
+            {form.envContent && (
+              <p className="text-xs text-slate-600 mt-1">
+                {form.envContent.split("\n").filter((l) => l.trim() && !l.startsWith("#")).length} variable(s) detectada(s)
+              </p>
+            )}
+          </div>
+
+          {/* ── Puerto ─────────────────────────────── */}          <div>
             <label className="text-xs font-semibold text-slate-400 uppercase tracking-wider">
               Puerto a exponer <span className="text-cyan-400">*</span>
             </label>

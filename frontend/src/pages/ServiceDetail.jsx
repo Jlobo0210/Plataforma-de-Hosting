@@ -62,6 +62,12 @@ export default function ServiceDetail() {
   const [loading, setLoading] = useState(true);
   const [error, setError]     = useState("");
 
+  // Edición de variables de entorno
+  const [envContent, setEnvContent]   = useState("");
+  const [envDirty, setEnvDirty]       = useState(false);
+  const [envSaving, setEnvSaving]     = useState(false);
+  const [envSaved, setEnvSaved]       = useState(false);
+
   // Simula actualización de métricas en tiempo real
   const [metrics, setMetrics] = useState(null);
   const metricsInterval = useRef(null);
@@ -71,6 +77,7 @@ export default function ServiceDetail() {
       .then((p) => {
         setProject(p);
         setMetrics(p.metrics);
+        setEnvContent(p.envContent || "");
       })
       .catch(() => setError("Proyecto no encontrado"))
       .finally(() => setLoading(false));
@@ -95,6 +102,22 @@ export default function ServiceDetail() {
 
     return () => clearInterval(metricsInterval.current);
   }, [project]);
+
+  const handleSaveEnv = async () => {
+    setEnvSaving(true);
+    setEnvSaved(false);
+    try {
+      await api.updateEnv(project.id, envContent);
+      setProject((p) => ({ ...p, envContent }));
+      setEnvDirty(false);
+      setEnvSaved(true);
+      setTimeout(() => setEnvSaved(false), 3000);
+    } catch (err) {
+      console.error("❌ Error guardando variables:", err);
+    } finally {
+      setEnvSaving(false);
+    }
+  };
 
   // ── Loading ──────────────────────────────────────────────
   if (loading) return (
@@ -348,6 +371,77 @@ export default function ServiceDetail() {
           </div>
 
         </div>
+
+        {/* ── Variables de entorno (ancho completo) ───── */}
+        <div className="lg:col-span-3 bg-slate-900 border border-slate-700/60 rounded-2xl p-5">
+          <div className="flex items-center justify-between mb-4">
+            <div className="flex items-center gap-2">
+              <div className="w-1 h-4 bg-emerald-600 rounded-full" />
+              <h2 className="text-sm font-semibold text-slate-200">Variables de entorno</h2>
+              {envContent && (
+                <span className="text-xs text-slate-600 font-mono">
+                  {envContent.split("\n").filter((l) => l.trim() && !l.startsWith("#")).length} variable(s)
+                </span>
+              )}
+            </div>
+
+            <div className="flex items-center gap-3">
+              {envSaved && (
+                <span className="flex items-center gap-1.5 text-xs text-emerald-400">
+                  <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+                  </svg>
+                  Guardado
+                </span>
+              )}
+              <button
+                onClick={handleSaveEnv}
+                disabled={!envDirty || envSaving}
+                className="flex items-center gap-2 px-4 py-1.5 rounded-lg bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-semibold transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                {envSaving ? (
+                  <>
+                    <svg className="w-3.5 h-3.5 animate-spin" fill="none" viewBox="0 0 24 24">
+                      <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" className="opacity-25" />
+                      <path fill="currentColor" className="opacity-75" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z" />
+                    </svg>
+                    Guardando…
+                  </>
+                ) : (
+                  "Guardar cambios"
+                )}
+              </button>
+            </div>
+          </div>
+
+          <p className="text-xs text-slate-600 mb-3">
+            Edita el contenido de tu <span className="font-mono">.env</span> directamente. El backend lo re-inyectará al reiniciar el contenedor.
+          </p>
+
+          <textarea
+            value={envContent}
+            onChange={(e) => {
+              setEnvContent(e.target.value);
+              setEnvDirty(true);
+              setEnvSaved(false);
+            }}
+            rows={8}
+            spellCheck={false}
+            placeholder={"NODE_ENV=production\nPORT=3000\nDB_URL=postgres://...\nSECRET_KEY=..."}
+            className="w-full bg-slate-950 border border-slate-700/40 rounded-xl px-4 py-3 text-xs font-mono text-emerald-400 focus:outline-none focus:border-cyan-600 placeholder:text-slate-700 resize-y transition-colors leading-relaxed"
+          />
+
+          {envDirty && !envSaving && (
+            <p className="text-xs text-amber-500 mt-2 flex items-center gap-1.5">
+              <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                  d="M12 9v2m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+              </svg>
+              Hay cambios sin guardar
+            </p>
+          )}
+        </div>
+
       </div>
     </div>
   );
