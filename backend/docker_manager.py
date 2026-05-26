@@ -6,13 +6,22 @@ import threading
 import git
 import tempfile
 import shutil
+import urllib.request
 
 from env_utils import normalize_root_path, parse_env_content, write_build_env_files
 
 
-IDLE_TIMEOUT_SECONDS = 30 * 60  # PDF: apagar contenedores tras 30 min sin tráfico
-MONITOR_INTERVAL_SECONDS = 5
-IDLE_WATCHER_INTERVAL_SECONDS = 60
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return int(raw)
+
+
+IDLE_TIMEOUT_SECONDS = _env_int("IDLE_TIMEOUT_SECONDS", 30 * 60)
+MONITOR_INTERVAL_SECONDS = _env_int("MONITOR_INTERVAL_SECONDS", 5)
+IDLE_WATCHER_INTERVAL_SECONDS = _env_int("IDLE_WATCHER_INTERVAL_SECONDS", 60)
+HTTP_READY_TIMEOUT_SECONDS = _env_int("HTTP_READY_TIMEOUT_SECONDS", 15)
 
 
 class DockerManager:
@@ -113,6 +122,7 @@ class DockerManager:
             container = self.client.containers.get(info["container_id"])
             container.start()
             self._wait_for_container(container, timeout=15)
+            self._wait_for_http_ready(info["container_name"], info["port"])
             info["status"] = "active"
             print(f"⚡ Wake-on-request: {info['container_name']}")
         except Exception as e:
@@ -128,6 +138,24 @@ class DockerManager:
             print(f"⏳ Esperando contenedor {container.name} ({container.status})...")
             time.sleep(0.5)
         raise Exception(f"Timeout esperando el contenedor {container.name}")
+
+    def _wait_for_http_ready(self, container_name: str, port: int, timeout: int | None = None):
+        """Espera a que la app dentro del contenedor responda HTTP (evita 502 tras wake)."""
+        timeout = timeout or HTTP_READY_TIMEOUT_SECONDS
+        url = f"http://{container_name}:{port}/"
+        start = time.time()
+        last_error = "sin intentos"
+        while time.time() - start < timeout:
+            try:
+                req = urllib.request.Request(url, method="GET")
+                with urllib.request.urlopen(req, timeout=2) as resp:
+                    if resp.status < 500:
+                        print(f"✅ HTTP listo: {container_name}:{port}")
+                        return
+            except Exception as e:
+                last_error = str(e)
+            time.sleep(0.5)
+        raise Exception(f"Timeout esperando HTTP en {container_name}:{port} ({last_error})")
 
     def _stop_and_remove_container(self, container):
         try:
@@ -274,6 +302,7 @@ class DockerManager:
                 username=username,
                 environment=parsed_env or None,
             )
+            self._wait_for_http_ready(container_name, port)
 
             # Paso 4: Registrar el proyecto en el estado activo
             self.active_services[project_id] = {
@@ -343,6 +372,7 @@ class DockerManager:
             container = self.client.containers.get(info["container_id"])
             container.start()
             self._wait_for_container(container, timeout=15)
+            self._wait_for_http_ready(info["container_name"], info["port"])
             info["status"] = "active"
             info["last_active"] = time.time()
             print(f"✅ Proyecto habilitado: {info['container_name']}")
