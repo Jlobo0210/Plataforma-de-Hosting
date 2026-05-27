@@ -58,13 +58,15 @@ function StatusBadge({ status, lastActivity }) {
   );
 }
 
-export default function ServiceCard({ project, onDelete, onToggle }) {
+export default function ServiceCard({ project, isDeleting = false, onDelete, onToggle }) {
   const [confirming, setConfirming] = useState(false);
   const navigate = useNavigate();
 
   const handleDelete = () => {
+    if (isDeleting) return;
     if (confirming) {
       onDelete(project.id);
+      setConfirming(false);
     } else {
       setConfirming(true);
       setTimeout(() => setConfirming(false), 3000);
@@ -83,7 +85,7 @@ export default function ServiceCard({ project, onDelete, onToggle }) {
 
   return (
     <div className={`relative flex flex-col gap-3 p-4 rounded-xl bg-slate-800/50 border border-slate-700/50 transition-opacity
-      ${isStopped ? "opacity-60" : ""}`}
+      ${isStopped || isDeleting ? "opacity-60" : ""}`}
     >
       {/* ── Top: badges + switch ────────────────── */}
       <div className="flex items-center justify-between gap-2">
@@ -96,8 +98,8 @@ export default function ServiceCard({ project, onDelete, onToggle }) {
 
         {/* Toggle encendido/apagado */}
         <button
-          onClick={() => canToggle && onToggle(project.id, !project.enabled)}
-          disabled={!canToggle}
+          onClick={() => canToggle && !isDeleting && onToggle(project.id, !project.enabled)}
+          disabled={!canToggle || isDeleting}
           title={project.enabled ? "Apagar contenedor" : "Encender contenedor"}
           className="relative inline-flex items-center w-11 h-6 rounded-full transition-colors duration-300 disabled:opacity-40 focus:outline-none shrink-0"
           style={{ backgroundColor: project.enabled && !isStopped ? "#10b981" : "#475569" }}
@@ -151,13 +153,14 @@ export default function ServiceCard({ project, onDelete, onToggle }) {
       <div className="flex justify-end">
         <button
           onClick={handleDelete}
-          className={`text-xs px-3 py-1.5 rounded-lg border transition-all
+          disabled={isDeleting}
+          className={`text-xs px-3 py-1.5 rounded-lg border transition-all disabled:opacity-50 disabled:cursor-not-allowed
             ${confirming
               ? "bg-red-600 text-white border-red-600"
               : "text-slate-500 border-slate-700 hover:text-red-400 hover:border-red-800"
             }`}
         >
-          {confirming ? "¿Confirmar?" : "Eliminar"}
+          {isDeleting ? "Eliminando…" : confirming ? "¿Confirmar?" : "Eliminar"}
         </button>
       </div>
 
@@ -170,6 +173,19 @@ export default function ServiceCard({ project, onDelete, onToggle }) {
               <path fill="currentColor" className="opacity-75" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z" />
             </svg>
             Desplegando contenedor…
+          </div>
+        </div>
+      )}
+
+      {/* ── Overlay: deleting ──────────────────── */}
+      {isDeleting && (
+        <div className="absolute inset-0 rounded-xl bg-slate-900/60 flex items-center justify-center z-10">
+          <div className="flex items-center gap-2 bg-slate-900/95 px-4 py-2 rounded-full border border-red-700/50 text-xs text-red-300">
+            <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24">
+              <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" className="opacity-25" />
+              <path fill="currentColor" className="opacity-75" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z" />
+            </svg>
+            Eliminando proyecto…
           </div>
         </div>
       )}

@@ -6,7 +6,7 @@ import { useState } from "react";
  * Cuando el backend esté listo, el botón "Continuar con Roble" deberá
  * redirigir al flujo OAuth/SSO de Roble en lugar de usar el formulario local.
  */
-export default function LoginPage({ onLogin }) {
+export default function LoginPage({ onLogin, onGoToRegister, registered }) {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
@@ -64,6 +64,16 @@ export default function LoginPage({ onLogin }) {
               Autenticación vía Roble · Uninorte
             </div>
           </div>
+
+          {/* Banner cuenta creada */}
+          {registered && (
+            <div className="mx-8 mt-5 flex items-center gap-2 text-xs text-emerald-400 bg-emerald-900/20 border border-emerald-700/40 rounded-lg px-3 py-2">
+              <svg className="w-3.5 h-3.5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+              </svg>
+              Cuenta creada. Inicia sesión para continuar.
+            </div>
+          )}
 
           {/* Formulario */}
           <form onSubmit={handleSubmit} className="px-8 py-6 space-y-4">
@@ -155,12 +165,16 @@ export default function LoginPage({ onLogin }) {
               )}
             </button>
 
-            {/* Hint de credenciales demo */}
-            <div className="text-center">
-              <p className="text-xs text-slate-600">
-                Demo: cualquier correo <span className="text-slate-500">@uninorte.edu.co</span>
-              </p>
-            </div>
+            <p className="text-center text-xs text-slate-500 pt-1">
+              ¿No tienes cuenta?{" "}
+              <button
+                type="button"
+                onClick={() => onGoToRegister?.()}
+                className="text-cyan-400 hover:text-cyan-300 font-medium transition-colors"
+              >
+                Regístrate
+              </button>
+            </p>
           </form>
         </div>
 

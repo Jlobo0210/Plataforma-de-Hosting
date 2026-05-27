@@ -67,6 +67,7 @@ export default function ServiceDetail() {
   const [envDirty, setEnvDirty]       = useState(false);
   const [envSaving, setEnvSaving]     = useState(false);
   const [envSaved, setEnvSaved]       = useState(false);
+  const [envError, setEnvError]       = useState("");
 
   // Simula actualización de métricas en tiempo real
   const [metrics, setMetrics] = useState(null);
@@ -83,29 +84,34 @@ export default function ServiceDetail() {
       .finally(() => setLoading(false));
   }, [id]);
 
-  // Fluctuación simulada de métricas cada 3 segundos
+  // Polling de métricas reales cada 4 segundos
   useEffect(() => {
     if (!project || project.status !== "active") return;
 
-    metricsInterval.current = setInterval(() => {
-      setMetrics((prev) => {
-        if (!prev) return prev;
-        const delta = (v, range) => Math.max(0, v + (Math.random() - 0.5) * range);
-        return {
-          ...prev,
-          cpuPercent: Math.min(95, delta(prev.cpuPercent, 6)),
-          memoryMB:   Math.min(prev.memoryLimitMB, delta(prev.memoryMB, 10)),
-          requestsPerMin: Math.min(prev.requestsLimitPerMin, delta(prev.requestsPerMin, 4)),
-        };
-      });
-    }, 3000);
+    const pollMetrics = () => {
+      api.getById(id)
+        .then((p) => {
+          setMetrics(p.metrics);
+          setProject((prev) => prev ? {
+            ...prev,
+            status: p.status,
+            enabled: p.enabled,
+            lastActivity: p.lastActivity,
+          } : p);
+        })
+        .catch((err) => console.error("Error cargando métricas:", err));
+    };
+
+    pollMetrics();
+    metricsInterval.current = setInterval(pollMetrics, 4000);
 
     return () => clearInterval(metricsInterval.current);
-  }, [project]);
+  }, [id, project?.status]);
 
   const handleSaveEnv = async () => {
     setEnvSaving(true);
     setEnvSaved(false);
+    setEnvError("");
     try {
       await api.updateEnv(project.id, envContent);
       setProject((p) => ({ ...p, envContent }));
@@ -114,6 +120,7 @@ export default function ServiceDetail() {
       setTimeout(() => setEnvSaved(false), 3000);
     } catch (err) {
       console.error("❌ Error guardando variables:", err);
+      setEnvError(err.message || "No se pudieron guardar las variables de entorno");
     } finally {
       setEnvSaving(false);
     }
@@ -305,18 +312,20 @@ export default function ServiceDetail() {
                     unit="%"
                     color="bg-cyan-500"
                   />
-                  <p className="text-xs text-slate-600 mt-2">Límite: 1 vCPU (--cpus=1)</p>
+                  <p className="text-xs text-slate-600 mt-2">
+                    Límite: {metrics?.cpuLimitVcpu ?? 0.5} vCPU (--cpus={metrics?.cpuLimitVcpu ?? 0.5})
+                  </p>
                 </div>
                 <div className="bg-slate-950/50 rounded-xl p-4 border border-slate-800">
                   <p className="text-xs text-slate-500 uppercase tracking-wider mb-3">Memoria</p>
                   <GaugeBar
                     label="RAM usada"
                     value={metrics ? Math.round(metrics.memoryMB) : 0}
-                    max={metrics?.memoryLimitMB || 512}
+                    max={metrics?.memoryLimitMB || 256}
                     unit=" MB"
                     color="bg-violet-500"
                   />
-                  <p className="text-xs text-slate-600 mt-2">Límite: {metrics?.memoryLimitMB || 512} MB (--memory)</p>
+                  <p className="text-xs text-slate-600 mt-2">Límite: {metrics?.memoryLimitMB || 256} MB (--memory)</p>
                 </div>
               </div>
             )}
@@ -415,7 +424,10 @@ export default function ServiceDetail() {
           </div>
 
           <p className="text-xs text-slate-600 mb-3">
-            Edita el contenido de tu <span className="font-mono">.env</span> directamente. El backend lo re-inyectará al reiniciar el contenedor.
+            Edita el contenido de tu <span className="font-mono">.env</span> directamente.{" "}
+            {project.containerType === "compose"
+              ? "El backend bajará y volverá a levantar el stack docker-compose con el nuevo .env."
+              : "El backend lo re-inyectará al reconstruir y recrear el contenedor."}
           </p>
 
           <textarea
@@ -424,6 +436,7 @@ export default function ServiceDetail() {
               setEnvContent(e.target.value);
               setEnvDirty(true);
               setEnvSaved(false);
+              setEnvError("");
             }}
             rows={8}
             spellCheck={false}
@@ -431,7 +444,17 @@ export default function ServiceDetail() {
             className="w-full bg-slate-950 border border-slate-700/40 rounded-xl px-4 py-3 text-xs font-mono text-emerald-400 focus:outline-none focus:border-cyan-600 placeholder:text-slate-700 resize-y transition-colors leading-relaxed"
           />
 
-          {envDirty && !envSaving && (
+          {envError && (
+            <p className="text-xs text-red-400 mt-2 flex items-center gap-1.5">
+              <svg className="w-3 h-3 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                  d="M12 9v2m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+              </svg>
+              {envError}
+            </p>
+          )}
+
+          {envDirty && !envSaving && !envError && (
             <p className="text-xs text-amber-500 mt-2 flex items-center gap-1.5">
               <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}

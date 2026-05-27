@@ -1,15 +1,20 @@
 from fastapi import FastAPI, HTTPException, Header, Depends, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.openapi.utils import get_openapi
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
 from docker_manager import DockerManager
 from nginx_manager import NginxManager
 import threading
+import asyncio
+import base64
+import json
+import requests as _requests
 
 docker_mgr = DockerManager()
 nginx_mgr = NginxManager()
 
-SUPPORTED_CONTAINER_TYPES = {"dockerfile"}
+SUPPORTED_CONTAINER_TYPES = {"dockerfile", "docker-compose"}
 
 
 @asynccontextmanager
@@ -30,7 +35,29 @@ def _cleanup():
     docker_mgr.cleanup_all()
 
 
-app = FastAPI(lifespan=lifespan)
+app = FastAPI(lifespan=lifespan, swagger_ui_init_oauth={},)
+
+def custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+    schema = get_openapi(
+        title="Hosting Platform",
+        version="1.0.0",
+        routes=app.routes,
+    )
+    schema["components"]["securitySchemes"] = {
+        "BearerAuth": {
+            "type": "http",
+            "scheme": "bearer",
+        }
+    }
+    for path in schema["paths"].values():
+        for method in path.values():
+            method["security"] = [{"BearerAuth": []}]
+    app.openapi_schema = schema
+    return schema
+
+app.openapi = custom_openapi
 
 app.add_middleware(
     CORSMiddleware,
@@ -40,17 +67,48 @@ app.add_middleware(
 )
 
 
-def get_username(x_username: str | None = Header(default=None)) -> str:
-    """
-    Stub de autenticación.
+ROBLE_DB = "proyecto_final_pc2_86b1196e6b"
+ROBLE_VERIFY = f"https://roble-api.openlab.uninorte.edu.co/auth/{ROBLE_DB}/verify-token"
 
-    TODO(Roble): reemplazar por validación de un Bearer token contra el
-    endpoint oficial de Roble y extraer el username de los claims.
-    Mientras tanto, el frontend debe enviar el header `X-Username`.
-    """
-    if not x_username:
-        raise HTTPException(status_code=401, detail="Falta header X-Username")
-    return x_username
+
+def _decode_jwt_payload(token: str) -> dict:
+    try:
+        part = token.split(".")[1]
+        part += "=" * (4 - len(part) % 4)
+        return json.loads(base64.urlsafe_b64decode(part))
+    except Exception:
+        return {}
+
+
+def _check_roble(token: str) -> bool:
+    try:
+        r = _requests.get(
+            ROBLE_VERIFY,
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=8,
+        )
+        return r.ok
+    except Exception:
+        return False
+
+
+async def get_username(authorization: str | None = Header(default=None)) -> str:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Token de autenticación requerido")
+
+    token = authorization[len("Bearer "):]
+
+    loop = asyncio.get_event_loop()
+    valid = await loop.run_in_executor(None, _check_roble, token)
+    if not valid:
+        raise HTTPException(status_code=401, detail="Token inválido o expirado")
+
+    claims = _decode_jwt_payload(token)
+    email = claims.get("email") or claims.get("sub") or ""
+    username = email.split("@")[0].replace(".", "") if "@" in email else email
+    if not username:
+        raise HTTPException(status_code=401, detail="No se pudo identificar al usuario")
+    return username
 
 
 def _require_owner(project_id: str, username: str) -> dict:
@@ -63,12 +121,23 @@ def _require_owner(project_id: str, username: str) -> dict:
     return info
 
 
+def _project_with_metrics(project_id: str, info: dict) -> dict:
+    public = {k: v for k, v in info.items() if k != "request_timestamps"}
+    return {**public, "metrics": docker_mgr.get_project_metrics(project_id)}
+
+
 class CreateProjectRequest(BaseModel):
     name: str
     repo_url: str
     container_type: str  # "dockerfile" (docker-compose pendiente)
     port: int
     description: str = ""
+    root_path: str = "."
+    env_content: str = ""
+
+
+class UpdateEnvRequest(BaseModel):
+    env_content: str = ""
 
 
 @app.post("/api/projects")
@@ -94,6 +163,8 @@ async def create_project(
             container_type=request.container_type,
             port=request.port,
             description=request.description,
+            root_path=request.root_path,
+            env_content=request.env_content,
         )
 
         hostname = nginx_mgr.add_project_route(
@@ -119,6 +190,8 @@ async def create_project(
         }
     except HTTPException:
         raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -127,7 +200,7 @@ async def create_project(
 async def list_projects(username: str = Depends(get_username)):
     """Lista los proyectos activos del usuario autenticado."""
     mine = {
-        pid: info
+        pid: _project_with_metrics(pid, info)
         for pid, info in docker_mgr.active_services.items()
         if info.get("username") == username
     }
@@ -137,7 +210,8 @@ async def list_projects(username: str = Depends(get_username)):
 @app.get("/api/projects/{project_id}")
 async def get_project(project_id: str, username: str = Depends(get_username)):
     """Obtiene un proyecto individual del usuario."""
-    return _require_owner(project_id, username)
+    info = _require_owner(project_id, username)
+    return _project_with_metrics(project_id, info)
 
 
 @app.delete("/api/projects/{project_id}")
@@ -167,6 +241,23 @@ async def disable_project(project_id: str, username: str = Depends(get_username)
     try:
         docker_mgr.disable_project(project_id)
         return {"success": True, "status": "inactive"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.patch("/api/projects/{project_id}/env")
+async def update_project_env(
+    project_id: str,
+    request: UpdateEnvRequest,
+    username: str = Depends(get_username),
+):
+    """Actualiza las variables de entorno recreando el contenedor o el stack compose."""
+    _require_owner(project_id, username)
+    try:
+        docker_mgr.update_project_env(project_id, request.env_content)
+        return docker_mgr.active_services[project_id]
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

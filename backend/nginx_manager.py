@@ -4,6 +4,9 @@ import re
 
 _SUBDOMAIN_RE = re.compile(r"[^a-z0-9-]")
 
+# 60 req/min por IP: burst=59 permite hasta 60 peticiones en ráfaga antes de 429.
+RATE_LIMIT_BURST = int(os.getenv("RATE_LIMIT_BURST", "59"))
+
 
 def _sanitize_label(value: str) -> str:
     """Convierte un nombre a un label DNS válido (minúsculas, [a-z0-9-])."""
@@ -58,12 +61,6 @@ class NginxManager:
             f"    listen 80;\n"
             f"    server_name {hostname};\n"
             f"\n"
-            f"    # Wake-on-request: NGINX consulta al backend antes de cada\n"
-            f"    # proxy_pass. Si el contenedor esta apagado por idle, el backend\n"
-            f"    # lo arranca y espera a que este listo (responde 204). Si\n"
-            f"    # devuelve no-2xx, NGINX aborta el request.\n"
-            f"    auth_request /_wake;\n"
-            f"\n"
             f"    location = /_wake {{\n"
             f"        internal;\n"
             f"        resolver 127.0.0.11 valid=5s;\n"
@@ -75,10 +72,13 @@ class NginxManager:
             f"        proxy_read_timeout 20s;\n"
             f"    }}\n"
             f"\n"
-            f"    # Rate limit: 60 req/min por IP (zona definida en nginx.conf)\n"
-            f"    limit_req zone=hosting_ratelimit burst=10 nodelay;\n"
-            f"\n"
             f"    location / {{\n"
+            f"        # Wake antes del rate limit para reactivar contenedores idle\n"
+            f"        auth_request /_wake;\n"
+            f"\n"
+            f"        # Rate limit: 60 req/min por IP (solo tráfico del usuario)\n"
+            f"        limit_req zone=hosting_ratelimit burst={RATE_LIMIT_BURST} nodelay;\n"
+            f"\n"
             f"        resolver 127.0.0.11 valid=5s;\n"
             f"        set {d}upstream http://{container_name}:{port};\n"
             f"        proxy_pass {d}upstream;\n"
