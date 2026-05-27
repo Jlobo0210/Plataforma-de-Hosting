@@ -203,11 +203,12 @@ function normalizeProject(id, raw) {
     createdAt: lastEpoch ? new Date(lastEpoch * 1000).toISOString() : null,
     lastActivity: lastIso,
     metrics: {
-      cpuPercent: 0,
-      memoryMB: 0,
-      memoryLimitMB: 256, // PDF: --memory 256m
-      requestsPerMin: 0,
-      requestsLimitPerMin: 60,
+      cpuPercent: raw.metrics?.cpu_percent ?? 0,
+      memoryMB: raw.metrics?.memory_mb ?? 0,
+      memoryLimitMB: raw.metrics?.memory_limit_mb ?? 256,
+      cpuLimitVcpu: raw.metrics?.cpu_limit_vcpu ?? 0.5,
+      requestsPerMin: raw.metrics?.requests_per_min ?? 0,
+      requestsLimitPerMin: raw.metrics?.requests_limit_per_min ?? 60,
     },
   };
 }

@@ -121,6 +121,11 @@ def _require_owner(project_id: str, username: str) -> dict:
     return info
 
 
+def _project_with_metrics(project_id: str, info: dict) -> dict:
+    public = {k: v for k, v in info.items() if k != "request_timestamps"}
+    return {**public, "metrics": docker_mgr.get_project_metrics(project_id)}
+
+
 class CreateProjectRequest(BaseModel):
     name: str
     repo_url: str
@@ -195,7 +200,7 @@ async def create_project(
 async def list_projects(username: str = Depends(get_username)):
     """Lista los proyectos activos del usuario autenticado."""
     mine = {
-        pid: info
+        pid: _project_with_metrics(pid, info)
         for pid, info in docker_mgr.active_services.items()
         if info.get("username") == username
     }
@@ -205,7 +210,8 @@ async def list_projects(username: str = Depends(get_username)):
 @app.get("/api/projects/{project_id}")
 async def get_project(project_id: str, username: str = Depends(get_username)):
     """Obtiene un proyecto individual del usuario."""
-    return _require_owner(project_id, username)
+    info = _require_owner(project_id, username)
+    return _project_with_metrics(project_id, info)
 
 
 @app.delete("/api/projects/{project_id}")
@@ -245,7 +251,7 @@ async def update_project_env(
     request: UpdateEnvRequest,
     username: str = Depends(get_username),
 ):
-    """Actualiza las variables de entorno del proyecto recreando el contenedor."""
+    """Actualiza las variables de entorno recreando el contenedor o el stack compose."""
     _require_owner(project_id, username)
     try:
         docker_mgr.update_project_env(project_id, request.env_content)

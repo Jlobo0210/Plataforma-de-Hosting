@@ -22,6 +22,46 @@ IDLE_TIMEOUT_SECONDS = _env_int("IDLE_TIMEOUT_SECONDS", 30 * 60)
 MONITOR_INTERVAL_SECONDS = _env_int("MONITOR_INTERVAL_SECONDS", 5)
 IDLE_WATCHER_INTERVAL_SECONDS = _env_int("IDLE_WATCHER_INTERVAL_SECONDS", 60)
 HTTP_READY_TIMEOUT_SECONDS = _env_int("HTTP_READY_TIMEOUT_SECONDS", 15)
+REQUESTS_LIMIT_PER_MIN = _env_int("REQUESTS_LIMIT_PER_MIN", 60)
+DEFAULT_MEMORY_LIMIT_MB = 256
+DEFAULT_CPU_LIMIT_VCPU = 0.5
+
+
+def _cpu_percent_from_stats(stats: dict) -> float:
+    try:
+        cpu_stats = stats.get("cpu_stats") or {}
+        precpu_stats = stats.get("precpu_stats") or {}
+        cpu_usage = cpu_stats.get("cpu_usage") or {}
+        precpu_usage = precpu_stats.get("cpu_usage") or {}
+
+        cpu_delta = cpu_usage.get("total_usage", 0) - precpu_usage.get("total_usage", 0)
+        system_delta = cpu_stats.get("system_cpu_usage", 0) - precpu_stats.get("system_cpu_usage", 0)
+
+        if system_delta <= 0 or cpu_delta <= 0:
+            return 0.0
+
+        percpu = cpu_usage.get("percpu_usage") or []
+        cpu_count = len(percpu) if percpu else 1
+        return (cpu_delta / system_delta) * cpu_count * 100.0
+    except (TypeError, ZeroDivisionError, KeyError):
+        return 0.0
+
+
+def _memory_mb_from_stats(stats: dict) -> int:
+    try:
+        usage = stats.get("memory_stats", {}).get("usage", 0)
+        return int(usage // (1024 * 1024))
+    except (TypeError, KeyError):
+        return 0
+
+
+def _limits_from_container(container) -> tuple[int, float]:
+    host = container.attrs.get("HostConfig") or {}
+    mem = host.get("Memory") or 0
+    memory_limit_mb = int(mem // (1024 * 1024)) if mem > 0 else DEFAULT_MEMORY_LIMIT_MB
+    nano_cpus = host.get("NanoCpus") or 0
+    cpu_limit_vcpu = nano_cpus / 1_000_000_000 if nano_cpus > 0 else DEFAULT_CPU_LIMIT_VCPU
+    return memory_limit_mb, cpu_limit_vcpu
 
 
 class DockerManager:
@@ -90,8 +130,107 @@ class DockerManager:
 
     def _record_activity(self, project_id: str):
         info = self.active_services.get(project_id)
-        if info is not None:
-            info["last_active"] = time.time()
+        if info is None:
+            return
+        now = time.time()
+        info["last_active"] = now
+        timestamps = info.setdefault("request_timestamps", [])
+        timestamps.append(now)
+        cutoff = now - 60
+        info["request_timestamps"] = [t for t in timestamps if t >= cutoff]
+
+    def _get_metric_container_ids(self, info: dict) -> list[str]:
+        if info.get("container_type") == "docker-compose" and info.get("services"):
+            return [
+                s["container_id"]
+                for s in info["services"].values()
+                if s.get("container_id")
+            ]
+        if info.get("container_id"):
+            return [info["container_id"]]
+        return []
+
+    def get_project_metrics(self, project_id: str) -> dict:
+        info = self.active_services.get(project_id)
+        if not info:
+            return {
+                "cpu_percent": 0.0,
+                "memory_mb": 0,
+                "memory_limit_mb": DEFAULT_MEMORY_LIMIT_MB,
+                "cpu_limit_vcpu": DEFAULT_CPU_LIMIT_VCPU,
+                "requests_per_min": 0,
+                "requests_limit_per_min": REQUESTS_LIMIT_PER_MIN,
+            }
+
+        now = time.time()
+        requests_per_min = len([
+            t for t in info.get("request_timestamps", [])
+            if now - t < 60
+        ])
+
+        container_ids = self._get_metric_container_ids(info)
+        mem_limit_total = 0
+        cpu_limit_total = 0.0
+
+        if info.get("status") == "inactive" or not container_ids:
+            for cid in container_ids:
+                try:
+                    container = self.client.containers.get(cid)
+                    mem_lim, cpu_lim = _limits_from_container(container)
+                    mem_limit_total += mem_lim
+                    cpu_limit_total += cpu_lim
+                except docker.errors.NotFound:
+                    pass
+            if mem_limit_total == 0:
+                mem_limit_total = DEFAULT_MEMORY_LIMIT_MB * max(len(container_ids), 1)
+            if cpu_limit_total == 0:
+                cpu_limit_total = DEFAULT_CPU_LIMIT_VCPU * max(len(container_ids), 1)
+            return {
+                "cpu_percent": 0.0,
+                "memory_mb": 0,
+                "memory_limit_mb": mem_limit_total,
+                "cpu_limit_vcpu": round(cpu_limit_total, 2),
+                "requests_per_min": 0,
+                "requests_limit_per_min": REQUESTS_LIMIT_PER_MIN,
+            }
+
+        cpu_total = 0.0
+        mem_total = 0
+        any_running = False
+
+        for cid in container_ids:
+            try:
+                container = self.client.containers.get(cid)
+                container.reload()
+                mem_lim, cpu_lim = _limits_from_container(container)
+                mem_limit_total += mem_lim
+                cpu_limit_total += cpu_lim
+
+                if container.status != "running":
+                    continue
+
+                any_running = True
+                stats = container.stats(stream=False)
+                cpu_total += _cpu_percent_from_stats(stats)
+                mem_total += _memory_mb_from_stats(stats)
+            except docker.errors.NotFound:
+                pass
+            except Exception as e:
+                print(f"⚠️  Error obteniendo stats de {cid}: {e}")
+
+        if mem_limit_total == 0:
+            mem_limit_total = DEFAULT_MEMORY_LIMIT_MB * max(len(container_ids), 1)
+        if cpu_limit_total == 0:
+            cpu_limit_total = DEFAULT_CPU_LIMIT_VCPU * max(len(container_ids), 1)
+
+        return {
+            "cpu_percent": round(cpu_total, 1) if any_running else 0.0,
+            "memory_mb": mem_total,
+            "memory_limit_mb": mem_limit_total,
+            "cpu_limit_vcpu": round(cpu_limit_total, 2),
+            "requests_per_min": requests_per_min,
+            "requests_limit_per_min": REQUESTS_LIMIT_PER_MIN,
+        }
 
     def wake_project(self, project_id: str):
         """
@@ -241,7 +380,16 @@ class DockerManager:
             root_path=normalized_root if normalized_root != "." else ".",
         )
     
-    def _deploy_compose(self, *, build_context: str, project_id: str, container_name: str, image_tag: str, username: str, port: int, env_content: str, ) -> docker.models.containers.Container:
+    def _deploy_compose(
+        self,
+        *,
+        build_context: str,
+        project_id: str,
+        username: str,
+        port: int,
+        env_content: str,
+        compose_project_name: str | None = None,
+    ) -> tuple[docker.models.containers.Container, dict, str]:
         """
         Levanta un proyecto docker-compose, registra todos sus servicios
         y retorna el contenedor principal (el que expone el puerto indicado).
@@ -256,8 +404,8 @@ class DockerManager:
         # Escribe el .env si el usuario proporcionó variables
         write_build_env_files(build_context, env_content)
 
-        # Nombre de proyecto único para evitar colisiones entre usuarios
-        compose_project_name = f"hosting-{username}-{project_id}"
+        if compose_project_name is None:
+            compose_project_name = f"hosting-{username}-{project_id}"
 
         print(f"🔨 Levantando docker-compose ({compose_project_name})...")
         active_compose_file = compose_file if os.path.exists(compose_file) else compose_file_yaml
@@ -380,8 +528,6 @@ class DockerManager:
                 main_container, services_map, compose_project_name = self._deploy_compose(
                     build_context=build_context,
                     project_id=project_id,
-                    container_name=container_name,
-                    image_tag=image_tag,
                     username=username,
                     port=port,
                     env_content=env_content,
@@ -501,7 +647,7 @@ class DockerManager:
             raise Exception(f"Error habilitando proyecto: {str(e)}")
 
     def update_project_env(self, project_id: str, env_content: str):
-        """Actualiza el .env del proyecto reconstruyendo la imagen y recreando el contenedor."""
+        """Actualiza el .env del proyecto reconstruyendo o recreando el stack según el tipo."""
         if project_id not in self.active_services:
             raise Exception(f"Proyecto '{project_id}' no encontrado")
 
@@ -509,34 +655,65 @@ class DockerManager:
         parsed_env = parse_env_content(env_content)
         info["env_content"] = env_content
 
-        if info.get("container_type") != "dockerfile":
-            raise Exception("Actualizar variables solo está soportado para proyectos Dockerfile")
+        container_type = info.get("container_type")
+        if container_type not in ("dockerfile", "docker-compose"):
+            raise Exception(f"Tipo de contenedor '{container_type}' no soportado para actualizar variables")
 
         tmp_dir = tempfile.mkdtemp()
         try:
-            print(f"📥 Re-clonando repositorio para rebuild: {info['repo_url']}")
+            print(f"📥 Re-clonando repositorio: {info['repo_url']}")
             git.Repo.clone_from(info["repo_url"], tmp_dir)
 
-            try:
-                container = self.client.containers.get(info["container_id"])
-                self._stop_and_remove_container(container)
-            except docker.errors.NotFound:
-                pass
+            if container_type == "dockerfile":
+                try:
+                    container = self.client.containers.get(info["container_id"])
+                    self._stop_and_remove_container(container)
+                except docker.errors.NotFound:
+                    pass
 
-            self._rebuild_project_image(info, env_content, tmp_dir)
+                self._rebuild_project_image(info, env_content, tmp_dir)
 
-            container = self._run_project_container(
-                image_tag=info["image_tag"],
-                container_name=info["container_name"],
-                project_id=project_id,
-                username=info["username"],
-                environment=parsed_env or None,
-            )
+                container = self._run_project_container(
+                    image_tag=info["image_tag"],
+                    container_name=info["container_name"],
+                    project_id=project_id,
+                    username=info["username"],
+                    environment=parsed_env or None,
+                )
 
-            info["container_id"] = container.id
+                info["container_id"] = container.id
+                print(f"♻️  Variables de entorno actualizadas (rebuild): {info['container_name']}")
+
+            else:
+                compose_project_name = info.get("compose_project_name")
+                if not compose_project_name:
+                    raise Exception("Proyecto compose sin compose_project_name registrado")
+
+                print(f"🗑️  Bajando docker-compose para actualizar env: {compose_project_name}...")
+                whale = DockerClient(compose_project_name=compose_project_name)
+                whale.compose.down(
+                    remove_orphans=True,
+                    volumes=False,
+                )
+
+                build_context = self._resolve_build_context(tmp_dir, info.get("root_path", "."))
+                main_container, services_map, _ = self._deploy_compose(
+                    build_context=build_context,
+                    project_id=project_id,
+                    username=info["username"],
+                    port=info["port"],
+                    env_content=env_content,
+                    compose_project_name=compose_project_name,
+                )
+
+                info["container_id"] = main_container.id
+                info["container_name"] = main_container.name
+                info["services"] = services_map
+                self._wait_for_http_ready(main_container.name, info["port"])
+                print(f"♻️  Variables de entorno actualizadas (compose): {main_container.name}")
+
             info["status"] = "active"
             info["last_active"] = time.time()
-            print(f"♻️  Variables de entorno actualizadas (rebuild): {info['container_name']}")
         except Exception as e:
             raise Exception(f"Error actualizando variables de entorno: {str(e)}")
         finally:
