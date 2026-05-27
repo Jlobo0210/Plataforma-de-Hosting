@@ -1,5 +1,6 @@
 from fastapi import FastAPI, HTTPException, Header, Depends, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.openapi.utils import get_openapi
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
 from docker_manager import DockerManager
@@ -13,7 +14,7 @@ import requests as _requests
 docker_mgr = DockerManager()
 nginx_mgr = NginxManager()
 
-SUPPORTED_CONTAINER_TYPES = {"dockerfile"}
+SUPPORTED_CONTAINER_TYPES = {"dockerfile", "docker-compose"}
 
 
 @asynccontextmanager
@@ -34,7 +35,29 @@ def _cleanup():
     docker_mgr.cleanup_all()
 
 
-app = FastAPI(lifespan=lifespan)
+app = FastAPI(lifespan=lifespan, swagger_ui_init_oauth={},)
+
+def custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+    schema = get_openapi(
+        title="Hosting Platform",
+        version="1.0.0",
+        routes=app.routes,
+    )
+    schema["components"]["securitySchemes"] = {
+        "BearerAuth": {
+            "type": "http",
+            "scheme": "bearer",
+        }
+    }
+    for path in schema["paths"].values():
+        for method in path.values():
+            method["security"] = [{"BearerAuth": []}]
+    app.openapi_schema = schema
+    return schema
+
+app.openapi = custom_openapi
 
 app.add_middleware(
     CORSMiddleware,

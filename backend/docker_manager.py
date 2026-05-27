@@ -9,7 +9,7 @@ import shutil
 import urllib.request
 
 from env_utils import normalize_root_path, parse_env_content, write_build_env_files
-
+from python_on_whales import DockerClient
 
 def _env_int(name: str, default: int) -> int:
     raw = os.getenv(name)
@@ -205,15 +205,7 @@ class DockerManager:
             return repo_root
         return os.path.join(repo_root, normalized_root)
 
-    def _build_dockerfile_image(
-        self,
-        build_context: str,
-        image_tag: str,
-        env_content: str,
-        *,
-        normalized_root: str,
-        root_path: str,
-    ) -> None:
+    def _build_dockerfile_image(self, build_context: str, image_tag: str, env_content: str, *, normalized_root: str, root_path: str, ) -> None:
         dockerfile_path = os.path.join(build_context, "Dockerfile")
         if not os.path.isdir(build_context):
             raise Exception(f"La ruta '{root_path}' no existe en el repositorio")
@@ -248,18 +240,99 @@ class DockerManager:
             normalized_root=normalized_root,
             root_path=normalized_root if normalized_root != "." else ".",
         )
+    
+    def _deploy_compose(self, *, build_context: str, project_id: str, container_name: str, image_tag: str, username: str, port: int, env_content: str, ) -> docker.models.containers.Container:
+        """
+        Levanta un proyecto docker-compose, registra todos sus servicios
+        y retorna el contenedor principal (el que expone el puerto indicado).
+        """
 
-    def deploy_project(
-        self,
-        name: str,
-        username: str,
-        repo_url: str,
-        container_type: str,
-        port: int,
-        description: str = "",
-        root_path: str = ".",
-        env_content: str = "",
-    ) -> dict:
+        compose_file = os.path.join(build_context, "docker-compose.yml")
+        compose_file_yaml = os.path.join(build_context, "docker-compose.yaml")
+
+        if not os.path.exists(compose_file) and not os.path.exists(compose_file_yaml):
+            raise Exception("No se encontró docker-compose.yml en la ruta indicada del repositorio")
+
+        # Escribe el .env si el usuario proporcionó variables
+        write_build_env_files(build_context, env_content)
+
+        # Nombre de proyecto único para evitar colisiones entre usuarios
+        compose_project_name = f"hosting-{username}-{project_id}"
+
+        print(f"🔨 Levantando docker-compose ({compose_project_name})...")
+        active_compose_file = compose_file if os.path.exists(compose_file) else compose_file_yaml
+        whale = DockerClient(
+            compose_files=[active_compose_file],
+            compose_project_name=compose_project_name,
+        )
+        whale.compose.up(
+            build=True,
+            detach=True,
+            quiet=False,
+        )
+
+        # ── Obtener todos los contenedores del compose ────────────────
+        compose_containers = whale.compose.ps() 
+
+        if not compose_containers:
+            raise Exception("docker-compose no levantó ningún contenedor")
+
+        # ── Identificar el contenedor principal ───────────────────────
+        # Es el primero que expone el puerto indicado por el usuario.
+        # Si ninguno lo expone explícitamente, tomamos el primero.
+        main_container_whales = None
+        for c in compose_containers:
+            try:
+                # En python-on-whales los puertos son strings tipo "80/tcp"
+                ports = c.network_settings.ports or {}
+                port_keys = list(ports.keys()) if isinstance(ports, dict) else []
+                exposed_ports = [p.split("/")[0] for p in port_keys]
+                if str(port) in exposed_ports:
+                    main_container_whales = c
+                    break
+            except Exception:
+                pass
+        if main_container_whales is None:
+            main_container_whales = compose_containers[0]
+
+        # Convertir a objeto docker-sdk para ser consistente con el resto
+        main_container = self.client.containers.get(main_container_whales.id)
+
+        # ── Conectar todos los contenedores a platform_network ────────
+        # docker-compose crea su propia red, pero NGINX necesita alcanzar el contenedor principal por platform_network.
+        try:
+            network = self.client.networks.get(self.network_name)
+            network.connect(main_container)
+            print(f"🔗 Contenedor principal conectado a {self.network_name}")
+        except Exception as e:
+            print(f"⚠️  No se pudo conectar a {self.network_name}: {e}")
+
+        # ── Agregar labels de plataforma al contenedor principal ──────
+        # No se pueden agregar labels post-creación en Docker, así que los guardamos solo en active_services.
+
+        # ── Construir el mapa de servicios ────────────────────────────
+        services_map = {}
+        for c in compose_containers:
+            sdk_container = self.client.containers.get(c.id)
+            try:
+                labels = c.config.labels or {}
+                service_name = labels.get("com.docker.compose.service", sdk_container.name)
+            except Exception:
+                service_name = sdk_container.name
+            services_map[service_name] = {
+                "container_id": sdk_container.id,
+                "container_name": sdk_container.name,
+                "status": sdk_container.status,
+            }
+
+        print(f"✅ docker-compose levantado — servicios: {list(services_map.keys())}")
+        print(f"   Contenedor principal: {main_container.name}")
+
+        # Guardamos el nombre del proyecto compose para poder hacer
+        # compose down después
+        return main_container, services_map, compose_project_name
+
+    def deploy_project(self, name: str, username: str, repo_url: str, container_type: str, port: int, description: str = "", root_path: str = ".", env_content: str = "", ) -> dict:
         """
         Clona el repositorio del usuario y despliega el contenedor.
         """
@@ -279,6 +352,10 @@ class DockerManager:
 
             build_context = self._resolve_build_context(tmp_dir, normalized_root)
 
+            # Valores por defecto para campos de compose
+            services_map = {}
+            compose_project_name = None
+
             # Paso 2: Construir la imagen según el tipo de contenedor
             if container_type == "dockerfile":
                 self._build_dockerfile_image(
@@ -289,20 +366,31 @@ class DockerManager:
                     root_path=root_path,
                 )
 
+                # Paso 3: Lanzar el contenedor con límites de recursos
+                container = self._run_project_container(
+                    image_tag=image_tag,
+                    container_name=container_name,
+                    project_id=project_id,
+                    username=username,
+                    environment=parsed_env or None,
+                )
+                self._wait_for_http_ready(container_name, port)
+
             elif container_type == "docker-compose":
-                raise Exception("docker-compose aún no está soportado en esta versión") #Se agrega después, ya que necesita diseño más complejo
+                main_container, services_map, compose_project_name = self._deploy_compose(
+                    build_context=build_context,
+                    project_id=project_id,
+                    container_name=container_name,
+                    image_tag=image_tag,
+                    username=username,
+                    port=port,
+                    env_content=env_content,
+                )
+                container = main_container
+                container_name = main_container.name
+                self._wait_for_http_ready(container.name, port)
             else:
                 raise Exception(f"Tipo de contenedor '{container_type}' no soportado")
-
-            # Paso 3: Lanzar el contenedor con límites de recursos
-            container = self._run_project_container(
-                image_tag=image_tag,
-                container_name=container_name,
-                project_id=project_id,
-                username=username,
-                environment=parsed_env or None,
-            )
-            self._wait_for_http_ready(container_name, port)
 
             # Paso 4: Registrar el proyecto en el estado activo
             self.active_services[project_id] = {
@@ -322,6 +410,8 @@ class DockerManager:
                 "hostname": None,
                 "url": None,
                 "endpoint": f"http://{name}.{username}.localhost",
+                "services": services_map if container_type == "docker-compose" else {},
+                "compose_project_name": compose_project_name if container_type == "docker-compose" else None,
             }
 
             print(f"✅ Proyecto desplegado: {container_name}")
@@ -345,37 +435,68 @@ class DockerManager:
 
     def stop_project(self, project_id: str):
         """Detiene y elimina un proyecto."""
-        if project_id in self.active_services:
-            info = self.active_services[project_id]
-            try:
+        if project_id not in self.active_services:
+            return
+
+        info = self.active_services[project_id]
+
+        try:
+            if info.get("container_type") == "docker-compose" and info.get("compose_project_name"):
+                print(f"🗑️  Bajando docker-compose: {info['compose_project_name']}...")
+                whale = DockerClient(compose_project_name=info["compose_project_name"])
+                whale.compose.down(
+                    remove_orphans=True,
+                    volumes=False,
+                )
+                print(f"✅ docker-compose bajado: {info['compose_project_name']}")
+
+            else:
                 container = self.client.containers.get(info["container_id"])
                 self._stop_and_remove_container(container)
-                # Eliminar también la imagen construida
-                self.client.images.remove(info["image_tag"], force=True)
-                print(f"🗑️  Imagen eliminada: {info['image_tag']}")
-            except docker.errors.NotFound:
-                pass
-            except Exception as e:
-                print(f"⚠️  Error deteniendo proyecto: {e}")
-            finally:
-                del self.active_services[project_id]
+                try:
+                    self.client.images.remove(info["image_tag"], force=True)
+                    print(f"🗑️  Imagen eliminada: {info['image_tag']}")
+                except Exception as e:
+                    print(f"⚠️  No se pudo eliminar imagen: {e}")
+
+        except docker.errors.NotFound:
+            pass
+        except Exception as e:
+            print(f"⚠️  Error deteniendo proyecto: {e}")
+        finally:
+            del self.active_services[project_id]
 
     def enable_project(self, project_id: str):
-        """
-        Inicia un proyecto detenido manualmente (`inactive`) o por timeout
-        (`idle`) y refresca `last_active`.
-        """
+        """Inicia un proyecto detenido."""
         if project_id not in self.active_services:
             raise Exception(f"Proyecto '{project_id}' no encontrado")
+
         info = self.active_services[project_id]
+
         try:
-            container = self.client.containers.get(info["container_id"])
-            container.start()
-            self._wait_for_container(container, timeout=15)
-            self._wait_for_http_ready(info["container_name"], info["port"])
+            if info.get("container_type") == "docker-compose" and info.get("compose_project_name"):
+                print(f"▶️  Iniciando docker-compose: {info['compose_project_name']}...")
+                whale = DockerClient(compose_project_name=info["compose_project_name"])
+                whale.compose.start()
+
+                for service_name, service_info in info.get("services", {}).items():
+                    try:
+                        c = self.client.containers.get(service_info["container_id"])
+                        c.reload()
+                        service_info["status"] = c.status
+                    except Exception:
+                        pass
+
+            else:
+                container = self.client.containers.get(info["container_id"])
+                container.start()
+                self._wait_for_container(container, timeout=15)
+                self._wait_for_http_ready(info["container_name"], info["port"])
+
             info["status"] = "active"
             info["last_active"] = time.time()
             print(f"✅ Proyecto habilitado: {info['container_name']}")
+
         except Exception as e:
             raise Exception(f"Error habilitando proyecto: {str(e)}")
 
@@ -422,27 +543,59 @@ class DockerManager:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
     def disable_project(self, project_id: str):
-        """
-        Detiene manualmente un proyecto. Marca `inactive` (distinto de
-        `idle`) para que el wake-on-request no lo resucite a espaldas
-        del usuario.
-        """
+        """Detiene un proyecto sin eliminarlo."""
         if project_id not in self.active_services:
             raise Exception(f"Proyecto '{project_id}' no encontrado")
+
         info = self.active_services[project_id]
+
         try:
-            container = self.client.containers.get(info["container_id"])
-            container.stop()
+            if info.get("container_type") == "docker-compose" and info.get("compose_project_name"):
+                print(f"⏸️  Deteniendo docker-compose: {info['compose_project_name']}...")
+                whale = DockerClient(compose_project_name=info["compose_project_name"])
+                whale.compose.stop()
+
+                for service_name, service_info in info.get("services", {}).items():
+                    try:
+                        c = self.client.containers.get(service_info["container_id"])
+                        c.reload()
+                        service_info["status"] = c.status
+                    except Exception:
+                        pass
+
+            else:
+                container = self.client.containers.get(info["container_id"])
+                container.stop()
+
             info["status"] = "inactive"
             print(f"⏸️  Proyecto deshabilitado: {info['container_name']}")
+
         except Exception as e:
             raise Exception(f"Error deshabilitando proyecto: {str(e)}")
 
     def cleanup_all(self):
         """Limpia todos los proyectos al apagar la plataforma."""
+
+        # ── Primero bajar los proyectos docker-compose ────────────────
+        for project_id, info in list(self.active_services.items()):
+            if info.get("container_type") == "docker-compose" and info.get("compose_project_name"):
+                try:
+                    print(f"🗑️  Bajando compose: {info['compose_project_name']}...")
+                    whale = DockerClient(compose_project_name=info["compose_project_name"])
+                    whale.compose.down(
+                        remove_orphans=True,
+                        volumes=False,
+                    )
+                    print(f"✅ Compose bajado: {info['compose_project_name']}")
+                except Exception as e:
+                    print(f"⚠️  Error bajando compose {info['compose_project_name']}: {e}")
+
+        # ── Luego eliminar contenedores dockerfile en paralelo ────────
         containers_to_remove = []
 
         for project_id, info in list(self.active_services.items()):
+            if info.get("container_type") == "docker-compose":
+                continue
             try:
                 container = self.client.containers.get(info["container_id"])
                 containers_to_remove.append(container)
@@ -451,6 +604,7 @@ class DockerManager:
             except Exception as e:
                 print(f"⚠️  Error obteniendo contenedor {project_id}: {e}")
 
+        # Huérfanos dockerfile por si acaso
         try:
             orphans = self.client.containers.list(
                 all=True,
@@ -462,24 +616,21 @@ class DockerManager:
         except Exception as e:
             print(f"⚠️  Error buscando huérfanos: {e}")
 
-        if not containers_to_remove:
+        if containers_to_remove:
+            print(f"🗑️  Eliminando {len(containers_to_remove)} contenedor(es) dockerfile...")
+            threads = []
+            for container in containers_to_remove:
+                t = threading.Thread(
+                    target=self._stop_and_remove_container,
+                    args=(container,),
+                    daemon=True
+                )
+                threads.append(t)
+                t.start()
+            for t in threads:
+                t.join(timeout=10)
+        else:
             print("✅ No hay contenedores que limpiar")
-            return
-
-        print(f"🗑️  Eliminando {len(containers_to_remove)} contenedor(es)...")
-
-        threads = []
-        for container in containers_to_remove:
-            t = threading.Thread(
-                target=self._stop_and_remove_container,
-                args=(container,),
-                daemon=True
-            )
-            threads.append(t)
-            t.start()
-
-        for t in threads:
-            t.join(timeout=10)
 
         self.active_services.clear()
         print("✅ Limpieza completa")
