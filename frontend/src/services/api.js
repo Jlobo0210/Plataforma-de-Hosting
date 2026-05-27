@@ -1,88 +1,130 @@
 // ─────────────────────────────────────────────────────────────
 //  api.js  –  Capa de datos para la Plataforma de Hosting
 //
-//  Modo híbrido:
-//    • Auth (getUser, login, logout) → mock local (TODO Roble)
-//    • Proyectos (getAll, getById, create, remove, toggle) →
-//      backend FastAPI real, con normalización snake_case ↔ camelCase
-//      y header X-Username derivado del usuario mock.
-//
-//  Para volver al modo 100% mock (sin backend), poner USE_MOCK_PROJECTS = true.
+//  Auth → Roble (roble-api.openlab.uninorte.edu.co)
+//  Proyectos → backend FastAPI real
 // ─────────────────────────────────────────────────────────────
 
-import { MOCK_PROJECTS, MOCK_USER } from "./mockData";
+import { MOCK_PROJECTS } from "./mockData";
 
 const USE_MOCK_PROJECTS = false;
 const BASE_URL = "/api/projects";
 
-// ── Store mutable en memoria (solo para el mock) ─────────────
+const ROBLE_BASE =
+  "https://roble-api.openlab.uninorte.edu.co/auth/proyecto_final_pc2_86b1196e6b";
+
+// Usuario en memoria (se reconstruye desde el JWT al cargar)
+let currentUser = null;
+
+// ── Helpers JWT ───────────────────────────────────────────────
+function decodeJwt(token) {
+  try {
+    const b64 = token.split(".")[1].replace(/-/g, "+").replace(/_/g, "/");
+    const json = decodeURIComponent(
+      atob(b64)
+        .split("")
+        .map((c) => "%" + ("00" + c.charCodeAt(0).toString(16)).slice(-2))
+        .join("")
+    );
+    return JSON.parse(json);
+  } catch {
+    return {};
+  }
+}
+
+function userFromClaims(claims, fallbackEmail = "") {
+  const email = claims.email || fallbackEmail;
+  const raw = email.split("@")[0] || "usuario";
+  const username = raw.replace(/\./g, "");
+  const fullName = claims.name || raw.replace(/\./g, " ");
+  return {
+    id: claims.sub || claims.id || username,
+    username,
+    fullName,
+    email,
+    avatarInitials: username.slice(0, 2).toUpperCase(),
+  };
+}
+
+// ── Store mock de proyectos (solo si USE_MOCK_PROJECTS = true) ─
 let store = MOCK_PROJECTS.map((p) => ({ ...p }));
-let currentUser = { ...MOCK_USER };
 
 // ─────────────────────────────────────────────────────────────
-//  MOCK  –  Simula todas las respuestas del backend
+//  Auth real contra Roble
+// ─────────────────────────────────────────────────────────────
+const robleAuth = {
+  login: async (email, password) => {
+    const res = await fetch(`${ROBLE_BASE}/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email, password }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.message || "Credenciales incorrectas");
+    }
+    const { accessToken, refreshToken } = await res.json();
+    localStorage.setItem("roble_access", accessToken);
+    localStorage.setItem("roble_refresh", refreshToken);
+    const claims = decodeJwt(accessToken);
+    currentUser = userFromClaims(claims, email);
+    return { ...currentUser };
+  },
+
+  getUser: async () => {
+    const token = localStorage.getItem("roble_access");
+    if (!token) throw new Error("Sin sesión");
+    const res = await fetch(`${ROBLE_BASE}/verify-token`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) {
+      localStorage.removeItem("roble_access");
+      localStorage.removeItem("roble_refresh");
+      throw new Error("Sesión expirada");
+    }
+    const claims = decodeJwt(token);
+    currentUser = userFromClaims(claims);
+    return { ...currentUser };
+  },
+
+  logout: async () => {
+    const token = localStorage.getItem("roble_access");
+    if (token) {
+      await fetch(`${ROBLE_BASE}/logout`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}` },
+      }).catch(() => {});
+    }
+    localStorage.removeItem("roble_access");
+    localStorage.removeItem("roble_refresh");
+    currentUser = null;
+  },
+};
+
+// ─────────────────────────────────────────────────────────────
+//  Mock de proyectos (fallback)
 // ─────────────────────────────────────────────────────────────
 const mock = {
-  /** Devuelve el usuario autenticado actual */
-  getUser: () => Promise.resolve({ ...currentUser }),
-
-  /** Simula login: acepta cualquier credencial con dominio @uninorte.edu.co */
-  login: (email, password) => {
-    if (!email.endsWith("@uninorte.edu.co")) {
-      return Promise.reject(new Error("Solo se permite correo @uninorte.edu.co"));
-    }
-    if (!password || password.length < 4) {
-      return Promise.reject(new Error("Contraseña incorrecta"));
-    }
-    const username = email.split("@")[0].replace(".", "");
-    currentUser = {
-      id: "u-" + Date.now(),
-      username,
-      fullName: email.split("@")[0].replace(".", " "),
-      email,
-      avatarInitials: username.slice(0, 2).toUpperCase(),
-    };
-    return Promise.resolve({ ...currentUser });
-  },
-
-  logout: () => {
-    currentUser = null;
-    return Promise.resolve();
-  },
-
-  /** Devuelve todos los proyectos del usuario */
   getAll: () => Promise.resolve(store.map((p) => ({ ...p }))),
 
-  /**
-   * Crea un nuevo proyecto.
-   * @param {{ name, githubUrl, containerType, port }} data
-   */
   create: (data) => {
     const username = currentUser?.username || "user";
     const nuevo = {
       id: "p-" + Date.now(),
       name: data.name,
       githubUrl: data.githubUrl,
-      containerType: data.containerType,  // "dockerfile" | "compose"
+      containerType: data.containerType,
       rootPath: data.rootPath || ".",
       port: Number(data.port),
-      envContent: data.envContent || "", 
+      envContent: data.envContent || "",
       status: "building",
       enabled: true,
       assignedUrl: `http://${data.name}.${username}.localhost`,
       createdAt: new Date().toISOString(),
       lastActivity: new Date().toISOString(),
-      metrics: {
-        cpuPercent: 0,
-        memoryMB: 0,
-        memoryLimitMB: 512,
-        requestsPerMin: 0,
-        requestsLimitPerMin: 60,
-      },
+      metrics: { cpuPercent: 0, memoryMB: 0, memoryLimitMB: 512, requestsPerMin: 0, requestsLimitPerMin: 60 },
     };
     store = [nuevo, ...store];
-
-    // Simula que el contenedor termina de construirse en ~3 segundos
     setTimeout(() => {
       store = store.map((s) =>
         s.id === nuevo.id
@@ -90,61 +132,40 @@ const mock = {
           : s
       );
     }, 3000);
-
     return Promise.resolve({ ...nuevo });
   },
 
-  /** Elimina un proyecto por ID */
-  remove: (id) => {
-    store = store.filter((s) => s.id !== id);
-    return Promise.resolve();
-  },
+  remove: (id) => { store = store.filter((s) => s.id !== id); return Promise.resolve(); },
 
-  /**
-   * Enciende o apaga un contenedor.
-   * Equivale a docker start / docker stop en el backend.
-   */
   toggle: (id, enabled) => {
     store = store.map((s) =>
       s.id === id
-        ? {
-            ...s,
-            enabled,
-            status: enabled ? "active" : "stopped",
-            lastActivity: enabled ? new Date().toISOString() : s.lastActivity,
-            metrics: enabled
-              ? { ...s.metrics, cpuPercent: 5, memoryMB: 80 }
-              : { ...s.metrics, cpuPercent: 0, memoryMB: 0 },
-          }
+        ? { ...s, enabled, status: enabled ? "active" : "stopped", lastActivity: enabled ? new Date().toISOString() : s.lastActivity, metrics: enabled ? { ...s.metrics, cpuPercent: 5, memoryMB: 80 } : { ...s.metrics, cpuPercent: 0, memoryMB: 0 } }
         : s
     );
     return Promise.resolve(store.find((s) => s.id === id));
   },
 
-  /** Devuelve un proyecto por ID (para la vista de detalle) */
   getById: (id) => {
     const found = store.find((s) => s.id === id);
     if (!found) return Promise.reject(new Error("Proyecto no encontrado"));
     return Promise.resolve({ ...found });
   },
 
-
   updateEnv: (id, envContent) => {
-  store = store.map((s) => s.id === id ? { ...s, envContent } : s);
-  return Promise.resolve(store.find((s) => s.id === id));
-},
-
+    store = store.map((s) => (s.id === id ? { ...s, envContent } : s));
+    return Promise.resolve(store.find((s) => s.id === id));
+  },
 };
 
 // ─────────────────────────────────────────────────────────────
 //  Helpers de adaptación  ←→  backend FastAPI
 // ─────────────────────────────────────────────────────────────
 
-/** Header obligatorio del backend (stub auth Roble). */
 function authHeaders() {
-  const username = currentUser?.username;
+  const token = localStorage.getItem("roble_access");
   const headers = { "Content-Type": "application/json" };
-  if (username) headers["X-Username"] = username;
+  if (token) headers["Authorization"] = `Bearer ${token}`;
   return headers;
 }
 
@@ -286,24 +307,13 @@ const apiProjects = {
 };
 
 // ─────────────────────────────────────────────────────────────
-//  Export híbrido
-//    • Auth viene del mock (login con @uninorte.edu.co; setea currentUser)
-//    • Proyectos van al backend real con X-Username = currentUser.username
-//
-//  Si USE_MOCK_PROJECTS = true, se cae a 100% mock.
+//  Export  — Auth real con Roble, proyectos contra backend real
 // ─────────────────────────────────────────────────────────────
 export default {
-  getUser: mock.getUser,
-  login: mock.login,
-  logout: mock.logout,
+  getUser: robleAuth.getUser,
+  login: robleAuth.login,
+  logout: robleAuth.logout,
   ...(USE_MOCK_PROJECTS
-    ? {
-        getAll: mock.getAll,
-        getById: mock.getById,
-        create: mock.create,
-        remove: mock.remove,
-        toggle: mock.toggle,
-        updateEnv: mock.updateEnv, 
-      }
+    ? { getAll: mock.getAll, getById: mock.getById, create: mock.create, remove: mock.remove, toggle: mock.toggle, updateEnv: mock.updateEnv }
     : apiProjects),
 };
