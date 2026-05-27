@@ -12,6 +12,8 @@ export default function App() {
   const [screen, setScreen] = useState("login"); // "login" | "register"
   const [justRegistered, setJustRegistered] = useState(false);
   const [projects, setProjects] = useState([]);
+  const [projectsLoading, setProjectsLoading] = useState(false);
+  const [deletingProjectId, setDeletingProjectId] = useState(null);
   const [modalOpen, setModalOpen] = useState(false);
 
   // ── Verificar sesión al montar ────────────────────────────
@@ -23,21 +25,31 @@ export default function App() {
       .finally(() => setAuthChecked(true));
   }, []);
 
-  // ── Polling de proyectos (solo si hay sesión) ─────────────
+  // ── Carga de proyectos bajo demanda ───────────────────────
   const loadProjects = useCallback(async () => {
+    setProjectsLoading(true);
     try {
       const data = await api.getAll();
       if (Array.isArray(data)) setProjects(data);
     } catch (err) {
       console.error("❌ Error cargando proyectos:", err);
+    } finally {
+      setProjectsLoading(false);
     }
   }, []);
 
   useEffect(() => {
     if (!user) return;
     loadProjects();
-    const interval = setInterval(loadProjects, 5000);
-    return () => clearInterval(interval);
+  }, [user, loadProjects]);
+
+  useEffect(() => {
+    if (!user) return;
+    const onVisible = () => {
+      if (document.visibilityState === "visible") loadProjects();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => document.removeEventListener("visibilitychange", onVisible);
   }, [user, loadProjects]);
 
   // ── Handlers ──────────────────────────────────────────────
@@ -54,37 +66,30 @@ export default function App() {
 
   const handleCreate = async (data) => {
     try {
-      const nuevo = await api.create(data);
-      setProjects((prev) => [nuevo, ...prev]);
+      await api.create(data);
+      await loadProjects();
     } catch (err) {
       console.error("❌ Error creando proyecto:", err);
+      throw err;
     }
   };
 
   const handleDelete = async (id) => {
+    setDeletingProjectId(id);
     try {
       await api.remove(id);
-      setProjects((prev) => prev.filter((p) => p.id !== id));
+      await loadProjects();
     } catch (err) {
       console.error("❌ Error eliminando proyecto:", err);
+    } finally {
+      setDeletingProjectId(null);
     }
   };
 
   const handleToggle = async (id, enabled) => {
     try {
       await api.toggle(id, enabled);
-      setProjects((prev) =>
-        prev.map((p) =>
-          p.id === id
-            ? {
-                ...p,
-                enabled,
-                status: enabled ? "active" : "stopped",
-                lastActivity: enabled ? new Date().toISOString() : p.lastActivity,
-              }
-            : p
-        )
-      );
+      await loadProjects();
     } catch (err) {
       console.error("❌ Error toggling proyecto:", err);
     }
@@ -158,6 +163,8 @@ export default function App() {
         <div className="flex-1 px-8 py-6">
           <Dashboard
             projects={projects}
+            loading={projectsLoading}
+            deletingProjectId={deletingProjectId}
             onDelete={handleDelete}
             onToggle={handleToggle}
           />
