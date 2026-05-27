@@ -3,11 +3,14 @@ import Sidebar from "../components/Sidebar";
 import Dashboard from "./Dashboard";
 import CreateServiceModal from "../components/CreateServiceModal";
 import LoginPage from "./Loginpage";
+import RegisterPage from "./RegisterPage";
 import api from "../services/api";
 
 export default function App() {
   const [user, setUser] = useState(null);
   const [authChecked, setAuthChecked] = useState(false);
+  const [screen, setScreen] = useState("login"); // "login" | "register"
+  const [justRegistered, setJustRegistered] = useState(false);
   const [projects, setProjects] = useState([]);
   const [modalOpen, setModalOpen] = useState(false);
 
@@ -102,9 +105,25 @@ export default function App() {
     );
   }
 
-  // ── Sin sesión → Login ────────────────────────────────────
+  // ── Sin sesión → Login o Register ────────────────────────
   if (!user) {
-    return <LoginPage onLogin={handleLogin} />;
+    if (screen === "register") {
+      return (
+        <RegisterPage
+          onGoToLogin={(reason) => {
+            setJustRegistered(reason === "registered");
+            setScreen("login");
+          }}
+        />
+      );
+    }
+    return (
+      <LoginPage
+        onLogin={handleLogin}
+        onGoToRegister={() => { setJustRegistered(false); setScreen("register"); }}
+        registered={justRegistered}
+      />
+    );
   }
 
   // ── Con sesión → App principal ────────────────────────────

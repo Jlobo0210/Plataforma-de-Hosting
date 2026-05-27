@@ -5,6 +5,10 @@ from contextlib import asynccontextmanager
 from docker_manager import DockerManager
 from nginx_manager import NginxManager
 import threading
+import asyncio
+import base64
+import json
+import requests as _requests
 
 docker_mgr = DockerManager()
 nginx_mgr = NginxManager()
@@ -40,17 +44,48 @@ app.add_middleware(
 )
 
 
-def get_username(x_username: str | None = Header(default=None)) -> str:
-    """
-    Stub de autenticación.
+ROBLE_DB = "proyecto_final_pc2_86b1196e6b"
+ROBLE_VERIFY = f"https://roble-api.openlab.uninorte.edu.co/auth/{ROBLE_DB}/verify-token"
 
-    TODO(Roble): reemplazar por validación de un Bearer token contra el
-    endpoint oficial de Roble y extraer el username de los claims.
-    Mientras tanto, el frontend debe enviar el header `X-Username`.
-    """
-    if not x_username:
-        raise HTTPException(status_code=401, detail="Falta header X-Username")
-    return x_username
+
+def _decode_jwt_payload(token: str) -> dict:
+    try:
+        part = token.split(".")[1]
+        part += "=" * (4 - len(part) % 4)
+        return json.loads(base64.urlsafe_b64decode(part))
+    except Exception:
+        return {}
+
+
+def _check_roble(token: str) -> bool:
+    try:
+        r = _requests.get(
+            ROBLE_VERIFY,
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=8,
+        )
+        return r.ok
+    except Exception:
+        return False
+
+
+async def get_username(authorization: str | None = Header(default=None)) -> str:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Token de autenticación requerido")
+
+    token = authorization[len("Bearer "):]
+
+    loop = asyncio.get_event_loop()
+    valid = await loop.run_in_executor(None, _check_roble, token)
+    if not valid:
+        raise HTTPException(status_code=401, detail="Token inválido o expirado")
+
+    claims = _decode_jwt_payload(token)
+    email = claims.get("email") or claims.get("sub") or ""
+    username = email.split("@")[0].replace(".", "") if "@" in email else email
+    if not username:
+        raise HTTPException(status_code=401, detail="No se pudo identificar al usuario")
+    return username
 
 
 def _require_owner(project_id: str, username: str) -> dict:
