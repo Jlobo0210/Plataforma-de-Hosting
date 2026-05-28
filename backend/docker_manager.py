@@ -64,6 +64,54 @@ def _limits_from_container(container) -> tuple[int, float]:
     return memory_limit_mb, cpu_limit_vcpu
 
 
+def _write_resources_override(compose_file: str, override_path: str) -> None:
+    """
+    Genera un docker-compose.platform-override.yml que aplica límites de
+    CPU y memoria a todos los servicios definidos en el compose original.
+
+    Estrategia: leer los servicios del compose del usuario con PyYAML,
+    construir un override que solo toca deploy.resources, y pasarlo como
+    segundo archivo a DockerClient. Así no se modifica el archivo original.
+
+    Los límites (256 MB / 0.5 vCPU) coinciden con los aplicados a
+    contenedores Dockerfile vía mem_limit y nano_cpus en _run_project_container.
+    """
+    import yaml  # import local: solo se usa aquí
+
+    services: list[str] = []
+    try:
+        with open(compose_file, "r") as f:
+            compose_data = yaml.safe_load(f) or {}
+        services = list((compose_data.get("services") or {}).keys())
+    except Exception as e:
+        print(f"⚠️  No se pudo leer servicios del compose para override: {e}")
+
+    if not services:
+        # Sin servicios conocidos: override genérico vacío (no aplica nada,
+        # pero al menos no rompe el up).
+        with open(override_path, "w") as f:
+            f.write("version: '3.8'\nservices: {}\n")
+        return
+
+    override: dict = {"version": "3.8", "services": {}}
+    for svc in services:
+        override["services"][svc] = {
+            "deploy": {
+                "resources": {
+                    "limits": {
+                        "cpus": str(DEFAULT_CPU_LIMIT_VCPU),   # "0.5"
+                        "memory": f"{DEFAULT_MEMORY_LIMIT_MB}m",  # "256m"
+                    }
+                }
+            }
+        }
+
+    with open(override_path, "w") as f:
+        yaml.dump(override, f, default_flow_style=False)
+
+    print(f"📋 Override de recursos generado ({len(services)} servicios): {override_path}")
+
+
 class DockerManager:
     def __init__(self):
         self.client = docker.from_env()
@@ -121,10 +169,25 @@ class DockerManager:
         if not info:
             return
         try:
-            container = self.client.containers.get(info["container_id"])
-            container.stop(timeout=5)
+            if info.get("container_type") == "docker-compose" and info.get("compose_project_name"):
+                # Para compose: parar todo el stack, no solo el contenedor principal
+                whale = DockerClient(compose_project_name=info["compose_project_name"])
+                whale.compose.stop()
+                # Sincronizar status del mapa de servicios
+                for service_info in info.get("services", {}).values():
+                    try:
+                        c = self.client.containers.get(service_info["container_id"])
+                        c.reload()
+                        service_info["status"] = c.status
+                    except Exception:
+                        pass
+                print(f"💤 Stack compose apagado por inactividad: {info['compose_project_name']}")
+            else:
+                container = self.client.containers.get(info["container_id"])
+                container.stop(timeout=5)
+                print(f"💤 Apagado por inactividad: {info['container_name']}")
+
             info["status"] = "idle"
-            print(f"💤 Apagado por inactividad: {info['container_name']}")
         except Exception as e:
             print(f"⚠️  Error apagando por idle {info.get('container_name')}: {e}")
 
@@ -258,12 +321,35 @@ class DockerManager:
             return
 
         try:
-            container = self.client.containers.get(info["container_id"])
-            container.start()
-            self._wait_for_container(container, timeout=15)
-            self._wait_for_http_ready(info["container_name"], info["port"])
+            if info.get("container_type") == "docker-compose" and info.get("compose_project_name"):
+                # Para compose: arrancar todo el stack, no solo el contenedor principal
+                whale = DockerClient(compose_project_name=info["compose_project_name"])
+                whale.compose.start()
+                # Reconectar el contenedor principal a platform_network si se perdió la conexión
+                try:
+                    main_container = self.client.containers.get(info["container_id"])
+                    network = self.client.networks.get(self.network_name)
+                    network.connect(main_container)
+                except Exception:
+                    pass  # Ya conectado o error no crítico
+                # Sincronizar status del mapa de servicios
+                for service_info in info.get("services", {}).values():
+                    try:
+                        c = self.client.containers.get(service_info["container_id"])
+                        c.reload()
+                        service_info["status"] = c.status
+                    except Exception:
+                        pass
+                self._wait_for_http_ready(info["container_name"], info["port"])
+                print(f"⚡ Wake-on-request (compose): {info['compose_project_name']}")
+            else:
+                container = self.client.containers.get(info["container_id"])
+                container.start()
+                self._wait_for_container(container, timeout=15)
+                self._wait_for_http_ready(info["container_name"], info["port"])
+                print(f"⚡ Wake-on-request: {info['container_name']}")
+
             info["status"] = "active"
-            print(f"⚡ Wake-on-request: {info['container_name']}")
         except Exception as e:
             raise RuntimeError(f"Cold start falló: {e}")
 
@@ -407,10 +493,19 @@ class DockerManager:
         if compose_project_name is None:
             compose_project_name = f"hosting-{username}-{project_id}"
 
-        print(f"🔨 Levantando docker-compose ({compose_project_name})...")
+        # ── Inyectar límites CPU/memoria vía override ─────────────────
+        # docker-compose ignora --cpus/--memory del CLI; los límites deben
+        # estar en el YAML bajo deploy.resources. En lugar de modificar el
+        # archivo del usuario, creamos un override que los sobreescribe en
+        # todos los servicios sin alterar el docker-compose.yml original.
         active_compose_file = compose_file if os.path.exists(compose_file) else compose_file_yaml
+        override_file = os.path.join(build_context, "docker-compose.platform-override.yml")
+        _write_resources_override(active_compose_file, override_file)
+
+        print(f"🔨 Levantando docker-compose ({compose_project_name})...")
+        compose_files = [active_compose_file, override_file]
         whale = DockerClient(
-            compose_files=[active_compose_file],
+            compose_files=compose_files,
             compose_project_name=compose_project_name,
         )
         whale.compose.up(

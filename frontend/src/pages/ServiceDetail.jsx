@@ -71,7 +71,7 @@ export default function ServiceDetail() {
 
   // Simula actualización de métricas en tiempo real
   const [metrics, setMetrics] = useState(null);
-  const metricsInterval = useRef(null);
+
 
   useEffect(() => {
     api.getById(id)
@@ -84,29 +84,22 @@ export default function ServiceDetail() {
       .finally(() => setLoading(false));
   }, [id]);
 
-  // Polling de métricas reales cada 4 segundos
-  useEffect(() => {
-    if (!project || project.status !== "active") return;
+    // Polling real de métricas cada 5 segundos
+    useEffect(() => {
+      if (!project) return;
 
-    const pollMetrics = () => {
-      api.getById(id)
-        .then((p) => {
-          setMetrics(p.metrics);
-          setProject((prev) => prev ? {
-            ...prev,
-            status: p.status,
-            enabled: p.enabled,
-            lastActivity: p.lastActivity,
-          } : p);
-        })
-        .catch((err) => console.error("Error cargando métricas:", err));
-    };
+      const interval = setInterval(async () => {
+        try {
+          const updated = await api.getById(id);
+          setMetrics(updated.metrics);
+          setProject((prev) => ({ ...prev, lastActivity: updated.lastActivity }));
+        } catch (err) {
+          console.error("Error actualizando métricas:", err);
+        }
+      }, 5000);
 
-    pollMetrics();
-    metricsInterval.current = setInterval(pollMetrics, 4000);
-
-    return () => clearInterval(metricsInterval.current);
-  }, [id, project?.status]);
+      return () => clearInterval(interval);
+    }, [project, id]);
 
   const handleSaveEnv = async () => {
     setEnvSaving(true);
