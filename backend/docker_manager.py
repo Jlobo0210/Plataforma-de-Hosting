@@ -314,6 +314,19 @@ class DockerManager:
         services_map = {}
         for c in compose_containers:
             sdk_container = self.client.containers.get(c.id)
+
+            # Límites de recursos
+            try:
+                sdk_container.update(
+                    cpu_quota=50000,
+                    cpu_period=100000,
+                    mem_limit="256m",
+                )
+                print(f"✅ Límites aplicados: {sdk_container.name}")
+            except Exception as e:
+                print(f"⚠️  No se pudieron aplicar límites a {c.id}: {e}")
+
+            # Mapa de servicios
             try:
                 labels = c.config.labels or {}
                 service_name = labels.get("com.docker.compose.service", sdk_container.name)
