@@ -1,7 +1,7 @@
 # Plataforma de Hosting Basada en Contenedores
 
 > Repositorio: [GitHub](<https://github.com/Jlobo0210/Plataforma-de-Hosting.git>)  
-> Video de demostración: [YouTube](<LINK_VIDEO_AQUÍ>)
+> Video de demostración: [YouTube](<https://youtu.be/-5rdpnjhAcI>)
 
 ---
 
@@ -151,9 +151,12 @@ Accede a `http://localhost` e inicia sesión con tu cuenta de **Roble**. Cada us
    - **URL del repositorio:** dirección del repositorio en GitHub
    - **Tipo de contenedor:** `dockerfile` o `docker-compose`
    - **Puerto:** puerto que expone tu aplicación
-   - **Descripción:** descripción breve del proyecto
+   - **Ruta raíz** *(opcional):* carpeta dentro del repositorio donde está el `Dockerfile` o `docker-compose.yml`
+   - **Variables de entorno** *(opcional):* contenido del `.env` que necesita tu aplicación
 3. Haz clic en **"Desplegar"**
 4. La plataforma clona el repositorio, construye la imagen y lanza el contenedor automáticamente
+
+> **Ruta raíz y variables de entorno** son campos adicionales que agregamos para facilitar el despliegue de proyectos con estructura de monorepo o que requieran conexión a bases de datos y servicios externos.
 
 El proyecto queda disponible en:
 ```
