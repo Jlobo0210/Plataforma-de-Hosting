@@ -8,7 +8,7 @@ import { minutesSinceActivity } from "../services/mockData";
  * Vista de detalle de un proyecto de hosting. Muestra:
  *  - URL asignada (nombreProyecto.nombreUsuario.localhost)
  *  - Información del repositorio y configuración
- *  - Métricas simuladas: CPU, Memoria
+ *  - Métricas en vivo: CPU (% de cuota), memoria
  *  - Control de Rate Limiting (solicitudes por minuto)
  *  - Estado de actividad y tiempo hasta auto-apagado
  */
@@ -299,14 +299,14 @@ export default function ServiceDetail() {
                 <div className="bg-slate-950/50 rounded-xl p-4 border border-slate-800">
                   <p className="text-xs text-slate-500 uppercase tracking-wider mb-3">CPU</p>
                   <GaugeBar
-                    label="Uso de CPU"
+                    label="% de vCPU asignados"
                     value={metrics ? Math.round(metrics.cpuPercent * 10) / 10 : 0}
                     max={100}
                     unit="%"
                     color="bg-cyan-500"
                   />
                   <p className="text-xs text-slate-600 mt-2">
-                    Límite: {metrics?.cpuLimitVcpu ?? 0.5} vCPU (--cpus={metrics?.cpuLimitVcpu ?? 0.5})
+                    Cuota: {metrics?.cpuLimitVcpu ?? 0.5} vCPU (--cpus={metrics?.cpuLimitVcpu ?? 0.5})
                   </p>
                 </div>
                 <div className="bg-slate-950/50 rounded-xl p-4 border border-slate-800">

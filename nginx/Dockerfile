@@ -14,6 +14,6 @@ RUN sed -i 's/\r//' /reload_watch.sh && chmod +x /reload_watch.sh
 
 # Healthcheck para saber si NGINX está listo
 HEALTHCHECK --interval=10s --timeout=3s --retries=3 \
-    CMD wget -qO- http://localhost/api/services || exit 1
+    CMD wget -qO- http://127.0.0.1/nginx-health || exit 1
 
 CMD ["/bin/sh", "-c", "nginx && /reload_watch.sh"]

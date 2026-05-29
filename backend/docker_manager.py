@@ -27,7 +27,8 @@ DEFAULT_MEMORY_LIMIT_MB = 256
 DEFAULT_CPU_LIMIT_VCPU = 0.5
 
 
-def _cpu_percent_from_stats(stats: dict) -> float:
+def _vcpu_used_from_stats(stats: dict) -> float:
+    """vCPUs usados en el intervalo de stats (uso medido, no % del host)."""
     try:
         cpu_stats = stats.get("cpu_stats") or {}
         precpu_stats = stats.get("precpu_stats") or {}
@@ -42,9 +43,15 @@ def _cpu_percent_from_stats(stats: dict) -> float:
 
         percpu = cpu_usage.get("percpu_usage") or []
         cpu_count = len(percpu) if percpu else 1
-        return (cpu_delta / system_delta) * cpu_count * 100.0
+        return (cpu_delta / system_delta) * cpu_count
     except (TypeError, ZeroDivisionError, KeyError):
         return 0.0
+
+
+def _cpu_percent_of_limit(vcpus_used: float, cpu_limit_vcpu: float) -> float:
+    """Porcentaje de la cuota CPU asignada (0–100), no del host."""
+    limit = cpu_limit_vcpu if cpu_limit_vcpu > 0 else DEFAULT_CPU_LIMIT_VCPU
+    return min(100.0, (vcpus_used / limit) * 100.0)
 
 
 def _memory_mb_from_stats(stats: dict) -> int:
@@ -218,6 +225,7 @@ class DockerManager:
         if not info:
             return {
                 "cpu_percent": 0.0,
+                "cpu_percent_of_limit": 0.0,
                 "memory_mb": 0,
                 "memory_limit_mb": DEFAULT_MEMORY_LIMIT_MB,
                 "cpu_limit_vcpu": DEFAULT_CPU_LIMIT_VCPU,
@@ -250,6 +258,7 @@ class DockerManager:
                 cpu_limit_total = DEFAULT_CPU_LIMIT_VCPU * max(len(container_ids), 1)
             return {
                 "cpu_percent": 0.0,
+                "cpu_percent_of_limit": 0.0,
                 "memory_mb": 0,
                 "memory_limit_mb": mem_limit_total,
                 "cpu_limit_vcpu": round(cpu_limit_total, 2),
@@ -257,7 +266,7 @@ class DockerManager:
                 "requests_limit_per_min": REQUESTS_LIMIT_PER_MIN,
             }
 
-        cpu_total = 0.0
+        vcpu_used_total = 0.0
         mem_total = 0
         any_running = False
 
@@ -274,7 +283,7 @@ class DockerManager:
 
                 any_running = True
                 stats = container.stats(stream=False)
-                cpu_total += _cpu_percent_from_stats(stats)
+                vcpu_used_total += _vcpu_used_from_stats(stats)
                 mem_total += _memory_mb_from_stats(stats)
             except docker.errors.NotFound:
                 pass
@@ -286,8 +295,15 @@ class DockerManager:
         if cpu_limit_total == 0:
             cpu_limit_total = DEFAULT_CPU_LIMIT_VCPU * max(len(container_ids), 1)
 
+        cpu_pct_of_limit = (
+            round(_cpu_percent_of_limit(vcpu_used_total, cpu_limit_total), 1)
+            if any_running
+            else 0.0
+        )
+
         return {
-            "cpu_percent": round(cpu_total, 1) if any_running else 0.0,
+            "cpu_percent": cpu_pct_of_limit,
+            "cpu_percent_of_limit": cpu_pct_of_limit,
             "memory_mb": mem_total,
             "memory_limit_mb": mem_limit_total,
             "cpu_limit_vcpu": round(cpu_limit_total, 2),

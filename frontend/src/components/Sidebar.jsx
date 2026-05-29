@@ -80,7 +80,7 @@ export default function Sidebar({ user, projects, onNewProject, onLogout }) {
             { icon: "⏱", text: "Auto-apagado tras 30 min inactivo" },
             { icon: "🔄", text: "Reinicio automático al recibir petición" },
             { icon: "⚡", text: "Límite: 60 req/min por contenedor" },
-            { icon: "💾", text: "Máx 512 MB RAM por proyecto" },
+            { icon: "💾", text: "Máx 256 MB RAM por proyecto" },
           ].map((item) => (
             <div key={item.text} className="flex items-start gap-2 text-xs text-slate-600">
               <span className="text-base leading-none">{item.icon}</span>

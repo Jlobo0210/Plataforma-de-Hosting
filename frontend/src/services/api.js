@@ -203,7 +203,7 @@ function normalizeProject(id, raw) {
     createdAt: lastEpoch ? new Date(lastEpoch * 1000).toISOString() : null,
     lastActivity: lastIso,
     metrics: {
-      cpuPercent: raw.metrics?.cpu_percent ?? 0,
+      cpuPercent: raw.metrics?.cpu_percent_of_limit ?? raw.metrics?.cpu_percent ?? 0,
       memoryMB: raw.metrics?.memory_mb ?? 0,
       memoryLimitMB: raw.metrics?.memory_limit_mb ?? 256,
       cpuLimitVcpu: raw.metrics?.cpu_limit_vcpu ?? 0.5,
