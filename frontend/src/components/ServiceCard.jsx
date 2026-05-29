@@ -149,6 +149,12 @@ export default function ServiceCard({ project, isDeleting = false, onDelete, onT
         <span className="font-mono text-slate-300">:{project.port}</span>
       </div>
 
+      {isError && project.deployError && (
+        <p className="text-xs text-red-400/90 bg-red-900/20 border border-red-800/40 rounded-lg px-3 py-2 line-clamp-3">
+          {project.deployError}
+        </p>
+      )}
+
       {/* ── Botón eliminar ───────────────────────── */}
       <div className="flex justify-end">
         <button

@@ -52,6 +52,14 @@ export default function App() {
     return () => document.removeEventListener("visibilitychange", onVisible);
   }, [user, loadProjects]);
 
+  useEffect(() => {
+    if (!user) return;
+    const hasBuilding = projects.some((p) => p.status === "building");
+    if (!hasBuilding) return;
+    const intervalId = setInterval(loadProjects, 4000);
+    return () => clearInterval(intervalId);
+  }, [user, projects, loadProjects]);
+
   // ── Handlers ──────────────────────────────────────────────
   const handleLogin = async (email, password) => {
     const loggedUser = await api.login(email, password); // lanza si falla
@@ -66,8 +74,8 @@ export default function App() {
 
   const handleCreate = async (data) => {
     try {
-      await api.create(data);
-      await loadProjects();
+      const created = await api.create(data);
+      setProjects((prev) => [created, ...prev.filter((p) => p.id !== created.id)]);
     } catch (err) {
       console.error("❌ Error creando proyecto:", err);
       throw err;

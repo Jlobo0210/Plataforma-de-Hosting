@@ -121,6 +121,11 @@ def _require_owner(project_id: str, username: str) -> dict:
     return info
 
 
+def _reject_if_deploying(info: dict) -> None:
+    if info.get("status") == "building":
+        raise HTTPException(status_code=409, detail="El proyecto se está desplegando")
+
+
 def _project_with_metrics(project_id: str, info: dict) -> dict:
     public = {k: v for k, v in info.items() if k != "request_timestamps"}
     return {**public, "metrics": docker_mgr.get_project_metrics(project_id)}
@@ -156,7 +161,8 @@ async def create_project(
         )
 
     try:
-        project_info = docker_mgr.deploy_project(
+        project_id = docker_mgr.start_deploy(
+            nginx_mgr,
             name=request.name,
             username=username,
             repo_url=request.repo_url,
@@ -166,28 +172,8 @@ async def create_project(
             root_path=request.root_path,
             env_content=request.env_content,
         )
-
-        hostname = nginx_mgr.add_project_route(
-            project_id=project_info["project_id"],
-            project_name=request.name,
-            username=username,
-            container_name=project_info["container_name"],
-            port=request.port,
-        )
-
-        url = f"http://{hostname}"
-        project_id = project_info["project_id"]
-        if project_id in docker_mgr.active_services:
-            docker_mgr.active_services[project_id]["hostname"] = hostname
-            docker_mgr.active_services[project_id]["url"] = url
-
-        return {
-            "success": True,
-            "project_id": project_id,
-            "hostname": hostname,
-            "url": url,
-            "message": f"Proyecto disponible en {url}",
-        }
+        info = docker_mgr.active_services[project_id]
+        return {"project_id": project_id, **_project_with_metrics(project_id, info)}
     except HTTPException:
         raise
     except ValueError as e:
@@ -226,7 +212,8 @@ async def delete_project(project_id: str, username: str = Depends(get_username))
 @app.patch("/api/projects/{project_id}/enable")
 async def enable_project(project_id: str, username: str = Depends(get_username)):
     """Habilita un proyecto que el usuario detuvo manualmente."""
-    _require_owner(project_id, username)
+    info = _require_owner(project_id, username)
+    _reject_if_deploying(info)
     try:
         docker_mgr.enable_project(project_id)
         return {"success": True, "status": "active"}
@@ -237,7 +224,8 @@ async def enable_project(project_id: str, username: str = Depends(get_username))
 @app.patch("/api/projects/{project_id}/disable")
 async def disable_project(project_id: str, username: str = Depends(get_username)):
     """Detiene manualmente un proyecto sin eliminarlo."""
-    _require_owner(project_id, username)
+    info = _require_owner(project_id, username)
+    _reject_if_deploying(info)
     try:
         docker_mgr.disable_project(project_id)
         return {"success": True, "status": "inactive"}
@@ -252,7 +240,8 @@ async def update_project_env(
     username: str = Depends(get_username),
 ):
     """Actualiza las variables de entorno recreando el contenedor o el stack compose."""
-    _require_owner(project_id, username)
+    info = _require_owner(project_id, username)
+    _reject_if_deploying(info)
     try:
         docker_mgr.update_project_env(project_id, request.env_content)
         return docker_mgr.active_services[project_id]

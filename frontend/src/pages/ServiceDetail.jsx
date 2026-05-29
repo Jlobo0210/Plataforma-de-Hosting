@@ -84,7 +84,6 @@ export default function ServiceDetail() {
       .finally(() => setLoading(false));
   }, [id]);
 
-    // Polling real de métricas cada 5 segundos
     useEffect(() => {
       if (!project) return;
 
@@ -92,14 +91,14 @@ export default function ServiceDetail() {
         try {
           const updated = await api.getById(id);
           setMetrics(updated.metrics);
-          setProject((prev) => ({ ...prev, lastActivity: updated.lastActivity }));
+          setProject(updated);
         } catch (err) {
           console.error("Error actualizando métricas:", err);
         }
-      }, 5000);
+      }, project.status === "building" ? 4000 : 5000);
 
       return () => clearInterval(interval);
-    }, [project, id]);
+    }, [project?.status, id]);
 
   const handleSaveEnv = async () => {
     setEnvSaving(true);
@@ -140,6 +139,8 @@ export default function ServiceDetail() {
 
   const mins = minutesSinceActivity(project.lastActivity);
   const isActive = project.status === "active";
+  const isBuilding = project.status === "building";
+  const isDeployError = project.status === "error";
   const minsToSleep = Math.max(0, 30 - mins);
 
   return (
@@ -181,12 +182,48 @@ export default function ServiceDetail() {
                     Activo
                   </span>
                 )}
+                {isBuilding && (
+                  <span className="inline-flex items-center gap-1.5 text-xs font-semibold px-2 py-0.5 rounded border bg-amber-900/30 text-amber-300 border-amber-700/40">
+                    <svg className="w-3 h-3 animate-spin" fill="none" viewBox="0 0 24 24">
+                      <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" className="opacity-25" />
+                      <path fill="currentColor" className="opacity-75" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z" />
+                    </svg>
+                    Desplegando
+                  </span>
+                )}
+                {isDeployError && (
+                  <span className="inline-flex items-center gap-1.5 text-xs font-semibold px-2 py-0.5 rounded border bg-red-900/30 text-red-300 border-red-700/40">
+                    Error de despliegue
+                  </span>
+                )}
               </div>
               <p className="text-xs text-slate-500 mt-0.5">{project.assignedUrl}</p>
             </div>
           </div>
         </div>
       </div>
+
+      {(isBuilding || isDeployError) && (
+        <div className="px-8 pt-4">
+          {isBuilding && (
+            <div className="flex items-center gap-3 rounded-xl border border-amber-800/40 bg-amber-900/20 px-4 py-3 text-sm text-amber-200">
+              <svg className="w-4 h-4 animate-spin shrink-0" fill="none" viewBox="0 0 24 24">
+                <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" className="opacity-25" />
+                <path fill="currentColor" className="opacity-75" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z" />
+              </svg>
+              Despliegue en curso. Clonando repositorio, construyendo imagen y levantando contenedor…
+            </div>
+          )}
+          {isDeployError && (
+            <div className="rounded-xl border border-red-800/40 bg-red-900/20 px-4 py-3 text-sm text-red-200">
+              <p className="font-semibold">No se pudo desplegar el proyecto</p>
+              {project.deployError && (
+                <p className="mt-1 text-xs font-mono text-red-300/90">{project.deployError}</p>
+              )}
+            </div>
+          )}
+        </div>
+      )}
 
       {/* ── Contenido ─────────────────────────────────── */}
       <div className="px-8 py-6 grid grid-cols-1 lg:grid-cols-3 gap-5">
@@ -292,7 +329,13 @@ export default function ServiceDetail() {
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.2}
                     d="M9 3H5a2 2 0 00-2 2v4m6-6h10a2 2 0 012 2v4M9 3v18m0 0h10a2 2 0 002-2V9M9 21H5a2 2 0 01-2-2V9m0 0h18" />
                 </svg>
-                <p className="text-sm">Contenedor detenido · métricas no disponibles</p>
+                <p className="text-sm">
+                  {isBuilding
+                    ? "Despliegue en curso · métricas no disponibles aún"
+                    : isDeployError
+                      ? "Despliegue fallido · métricas no disponibles"
+                      : "Contenedor detenido · métricas no disponibles"}
+                </p>
               </div>
             ) : (
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-5">
@@ -398,7 +441,7 @@ export default function ServiceDetail() {
               )}
               <button
                 onClick={handleSaveEnv}
-                disabled={!envDirty || envSaving}
+                disabled={!envDirty || envSaving || isBuilding || isDeployError}
                 className="flex items-center gap-2 px-4 py-1.5 rounded-lg bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-semibold transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
               >
                 {envSaving ? (

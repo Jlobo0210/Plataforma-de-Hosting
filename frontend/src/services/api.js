@@ -178,6 +178,8 @@ const STATUS_MAP = {
   active:   { enabled: true,  status: "active" },
   idle:     { enabled: true,  status: "active" },
   inactive: { enabled: false, status: "stopped" },
+  building: { enabled: false, status: "building" },
+  error:    { enabled: false, status: "error" },
 };
 
 /** Convierte un proyecto del backend (snake_case) al shape camelCase de la UI. */
@@ -196,6 +198,7 @@ function normalizeProject(id, raw) {
     description: raw.description ?? "",
     enabled: mapped.enabled,
     status: mapped.status,
+    deployError: raw.deploy_error ?? null,
     assignedUrl:
       raw.url ||
       raw.endpoint ||
@@ -256,10 +259,7 @@ const apiProjects = {
   },
 
   /**
-   * POST /api/projects
-   * Body UI: { name, githubUrl, containerType, port, description? }
-   * Tras crear, hace GET para devolver el proyecto completo (el POST
-   * solo retorna metadatos: project_id, hostname, url, message).
+   * POST /api/projects — responde al instante con status building.
    */
   create: async (data) => {
     const body = denormalizeCreate(data);
@@ -269,8 +269,8 @@ const apiProjects = {
       body: JSON.stringify(body),
     });
     if (!res.ok) throw new Error(await readError(res));
-    const meta = await res.json();
-    return apiProjects.getById(meta.project_id);
+    const raw = await res.json();
+    return normalizeProject(raw.project_id, raw);
   },
 
   /** DELETE /api/projects/:id */

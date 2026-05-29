@@ -10,6 +10,7 @@ import urllib.request
 
 from env_utils import normalize_root_path, parse_env_content, write_build_env_files
 from python_on_whales import DockerClient
+from nginx_manager import _sanitize_label
 
 def _env_int(name: str, default: int) -> int:
     raw = os.getenv(name)
@@ -147,11 +148,13 @@ class DockerManager:
         """
         while True:
             for pid, info in list(self.active_services.items()):
+                if info.get("status") in ("idle", "inactive", "building", "error"):
+                    continue
+                if not info.get("container_id"):
+                    continue
                 try:
                     container = self.client.containers.get(info["container_id"])
                     container.reload()
-                    if info.get("status") in ("idle", "inactive"):
-                        continue
                     info["status"] = "active" if container.status == "running" else "inactive"
                 except docker.errors.NotFound:
                     info["status"] = "inactive"
@@ -330,6 +333,12 @@ class DockerManager:
 
         if info.get("status") == "inactive":
             raise PermissionError("Proyecto deshabilitado por el usuario")
+
+        if info.get("status") == "building":
+            raise PermissionError("Despliegue en curso")
+
+        if info.get("status") == "error":
+            raise PermissionError("Proyecto en error de despliegue")
 
         self._record_activity(project_id)
 
@@ -604,31 +613,190 @@ class DockerManager:
         # compose down después
         return main_container, services_map, compose_project_name
 
-    def deploy_project(self, name: str, username: str, repo_url: str, container_type: str, port: int, description: str = "", root_path: str = ".", env_content: str = "", ) -> dict:
-        """
-        Clona el repositorio del usuario y despliega el contenedor.
-        """
+    def start_deploy(
+        self,
+        nginx_mgr,
+        *,
+        name: str,
+        username: str,
+        repo_url: str,
+        container_type: str,
+        port: int,
+        description: str = "",
+        root_path: str = ".",
+        env_content: str = "",
+    ) -> str:
+        """Registra el proyecto en estado building y lanza el deploy en background."""
         project_id = str(uuid.uuid4())[:8]
         container_name = f"project-{username}-{name}-{project_id}"
         image_tag = f"hosting-{username}-{name}:{project_id}"
+        normalized_root = normalize_root_path(root_path)
+        project_label = _sanitize_label(name)
+        user_label = _sanitize_label(username)
+        hostname = f"{project_label}.{user_label}.localhost"
+        url = f"http://{hostname}"
+        now = time.time()
 
+        self.active_services[project_id] = {
+            "container_id": None,
+            "container_name": container_name,
+            "image_tag": image_tag,
+            "name": name,
+            "username": username,
+            "repo_url": repo_url,
+            "container_type": container_type,
+            "port": port,
+            "description": description,
+            "root_path": normalized_root,
+            "env_content": env_content,
+            "status": "building",
+            "deploy_error": None,
+            "last_active": now,
+            "hostname": hostname,
+            "url": url,
+            "endpoint": url,
+            "services": {},
+            "compose_project_name": None,
+        }
+
+        thread = threading.Thread(
+            target=self._deploy_worker,
+            kwargs={
+                "project_id": project_id,
+                "nginx_mgr": nginx_mgr,
+                "name": name,
+                "username": username,
+                "repo_url": repo_url,
+                "container_type": container_type,
+                "port": port,
+                "description": description,
+                "root_path": root_path,
+                "env_content": env_content,
+                "container_name": container_name,
+                "image_tag": image_tag,
+            },
+            daemon=True,
+        )
+        thread.start()
+        print(f"🚧 Despliegue en curso: {container_name}")
+        return project_id
+
+    def _deploy_worker(
+        self,
+        *,
+        project_id: str,
+        nginx_mgr,
+        name: str,
+        username: str,
+        repo_url: str,
+        container_type: str,
+        port: int,
+        description: str,
+        root_path: str,
+        env_content: str,
+        container_name: str,
+        image_tag: str,
+    ) -> None:
+        deploy_result = None
+        try:
+            deploy_result = self._run_deploy(
+                project_id=project_id,
+                name=name,
+                username=username,
+                repo_url=repo_url,
+                container_type=container_type,
+                port=port,
+                root_path=root_path,
+                env_content=env_content,
+                container_name=container_name,
+                image_tag=image_tag,
+            )
+
+            info = self.active_services.get(project_id)
+            if info is None:
+                print(f"⚠️  Deploy cancelado (proyecto eliminado): {project_id}")
+                self._cleanup_deploy_result(deploy_result, image_tag, container_type)
+                return
+
+            hostname = nginx_mgr.add_project_route(
+                project_id=project_id,
+                project_name=name,
+                username=username,
+                container_name=deploy_result["container_name"],
+                port=port,
+            )
+            url = f"http://{hostname}"
+
+            info.update({
+                "container_id": deploy_result["container_id"],
+                "container_name": deploy_result["container_name"],
+                "image_tag": image_tag,
+                "description": description,
+                "status": "active",
+                "deploy_error": None,
+                "last_active": time.time(),
+                "hostname": hostname,
+                "url": url,
+                "endpoint": url,
+                "services": deploy_result.get("services") or {},
+                "compose_project_name": deploy_result.get("compose_project_name"),
+            })
+            print(f"✅ Proyecto desplegado: {deploy_result['container_name']}")
+
+        except Exception as e:
+            error_msg = str(e)
+            print(f"❌ Error desplegando {project_id}: {error_msg}")
+            if deploy_result:
+                self._cleanup_deploy_result(deploy_result, image_tag, container_type)
+
+            info = self.active_services.get(project_id)
+            if info is not None:
+                info["status"] = "error"
+                info["deploy_error"] = error_msg
+
+    def _cleanup_deploy_result(self, deploy_result: dict, image_tag: str, container_type: str) -> None:
+        try:
+            if container_type == "docker-compose" and deploy_result.get("compose_project_name"):
+                whale = DockerClient(compose_project_name=deploy_result["compose_project_name"])
+                whale.compose.down(remove_orphans=True, volumes=False)
+            elif deploy_result.get("container_id"):
+                container = self.client.containers.get(deploy_result["container_id"])
+                self._stop_and_remove_container(container)
+        except Exception as exc:
+            print(f"⚠️  Error limpiando deploy parcial: {exc}")
+        try:
+            self.client.images.remove(image_tag, force=True)
+        except Exception:
+            pass
+
+    def _run_deploy(
+        self,
+        *,
+        project_id: str,
+        name: str,
+        username: str,
+        repo_url: str,
+        container_type: str,
+        port: int,
+        root_path: str,
+        env_content: str,
+        container_name: str,
+        image_tag: str,
+    ) -> dict:
+        """Clona el repositorio y despliega el contenedor (sin registrar en active_services)."""
         tmp_dir = tempfile.mkdtemp()
         normalized_root = normalize_root_path(root_path)
         parsed_env = parse_env_content(env_content)
 
         try:
-            # Paso 1: Clonar el repositorio en una carpeta temporal
             print(f"📥 Clonando repositorio: {repo_url}")
             git.Repo.clone_from(repo_url, tmp_dir)
             print(f"✅ Repositorio clonado en {tmp_dir}")
 
             build_context = self._resolve_build_context(tmp_dir, normalized_root)
-
-            # Valores por defecto para campos de compose
             services_map = {}
             compose_project_name = None
 
-            # Paso 2: Construir la imagen según el tipo de contenedor
             if container_type == "dockerfile":
                 self._build_dockerfile_image(
                     build_context,
@@ -637,8 +805,6 @@ class DockerManager:
                     normalized_root=normalized_root,
                     root_path=root_path,
                 )
-
-                # Paso 3: Lanzar el contenedor con límites de recursos
                 container = self._run_project_container(
                     image_tag=image_tag,
                     container_name=container_name,
@@ -662,40 +828,18 @@ class DockerManager:
             else:
                 raise Exception(f"Tipo de contenedor '{container_type}' no soportado")
 
-            # Paso 4: Registrar el proyecto en el estado activo
-            self.active_services[project_id] = {
+            return {
                 "container_id": container.id,
                 "container_name": container_name,
                 "image_tag": image_tag,
-                "name": name,
-                "username": username,
-                "repo_url": repo_url,
-                "container_type": container_type,
-                "port": port,
-                "description": description,
-                "root_path": normalized_root,
-                "env_content": env_content,
-                "status": "active",
-                "last_active": time.time(),
-                "hostname": None,
-                "url": None,
-                "endpoint": f"http://{name}.{username}.localhost",
                 "services": services_map if container_type == "docker-compose" else {},
                 "compose_project_name": compose_project_name if container_type == "docker-compose" else None,
-            }
-
-            print(f"✅ Proyecto desplegado: {container_name}")
-
-            return {
-                "project_id": project_id,
-                "container_name": container_name,
-                "endpoint": f"http://{name}.{username}.localhost"
             }
 
         except Exception as e:
             try:
                 self.client.images.remove(image_tag, force=True)
-            except:
+            except Exception:
                 pass
             raise Exception(f"Error desplegando proyecto: {str(e)}")
 
@@ -710,6 +854,11 @@ class DockerManager:
 
         info = self.active_services[project_id]
 
+        if info.get("status") == "building":
+            del self.active_services[project_id]
+            print(f"🛑 Despliegue cancelado: {info.get('container_name', project_id)}")
+            return
+
         try:
             if info.get("container_type") == "docker-compose" and info.get("compose_project_name"):
                 print(f"🗑️  Bajando docker-compose: {info['compose_project_name']}...")
@@ -721,11 +870,15 @@ class DockerManager:
                 print(f"✅ docker-compose bajado: {info['compose_project_name']}")
 
             else:
-                container = self.client.containers.get(info["container_id"])
-                self._stop_and_remove_container(container)
+                if not info.get("container_id"):
+                    pass
+                else:
+                    container = self.client.containers.get(info["container_id"])
+                    self._stop_and_remove_container(container)
                 try:
-                    self.client.images.remove(info["image_tag"], force=True)
-                    print(f"🗑️  Imagen eliminada: {info['image_tag']}")
+                    if info.get("image_tag"):
+                        self.client.images.remove(info["image_tag"], force=True)
+                        print(f"🗑️  Imagen eliminada: {info['image_tag']}")
                 except Exception as e:
                     print(f"⚠️  No se pudo eliminar imagen: {e}")
 
