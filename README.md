@@ -1,6 +1,6 @@
 # Plataforma de Hosting Basada en Contenedores
 
-> Repositorio: [GitHub](<LINK_REPOSITORIO_AQUÍ>)  
+> Repositorio: [GitHub](<https://github.com/Jlobo0210/Plataforma-de-Hosting.git>)  
 > Video de demostración: [YouTube](<LINK_VIDEO_AQUÍ>)
 
 ---
